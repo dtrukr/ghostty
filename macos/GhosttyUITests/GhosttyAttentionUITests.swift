@@ -16,6 +16,36 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         try await Task.sleep(for: .milliseconds(150))
     }
 
+    private func rgbAtNormalizedPoint(_ image: NSImage, x: CGFloat, y: CGFloat) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return (0, 0, 0, 0)
+        }
+
+        // XCUITest uses a top-left origin for normalized coordinates. NSBitmapImageRep uses a
+        // bottom-left origin, so invert y.
+        let px = Int(max(0, min(CGFloat(cg.width - 1), x * CGFloat(cg.width - 1))))
+        let py = Int(max(0, min(CGFloat(cg.height - 1), (1.0 - y) * CGFloat(cg.height - 1))))
+
+        guard let c = image.colorAt(x: px, y: py)?.usingColorSpace(.sRGB) else {
+            return (0, 0, 0, 0)
+        }
+
+        var rr: CGFloat = 0
+        var gg: CGFloat = 0
+        var bb: CGFloat = 0
+        var aa: CGFloat = 0
+        c.getRed(&rr, green: &gg, blue: &bb, alpha: &aa)
+
+        return (UInt8(rr * 255), UInt8(gg * 255), UInt8(bb * 255), UInt8(aa * 255))
+    }
+
+    private func looksLikeBellBorder(_ c: (r: UInt8, g: UInt8, b: UInt8, a: UInt8)) -> Bool {
+        // BellBorderOverlay color is (1.0, 0.8, 0.0) at 0.5 opacity. We don't want to
+        // be overly strict, but it should read as "yellow-ish".
+        guard c.a > 200 else { return false }
+        return c.r >= 110 && c.g >= 90 && c.b <= 160 && c.r >= c.g
+    }
+
     override func setUp() async throws {
         try await super.setUp()
 
@@ -33,6 +63,56 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             keybind = cmd+]=goto_attention:next
             keybind = cmd+[=goto_attention:previous
             """
+        )
+    }
+
+    @MainActor
+    func testAttentionOnOutputIdleDoesNotTriggerFromSplitAlone() async throws {
+        // Regression coverage: splitting/resizing should not be treated as "output while
+        // unfocused" for attention-on-output-idle purposes. This should require actual
+        // output from an unfocused pane (command output, etc.).
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+
+            attention-on-output-idle = 200ms
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        // Create a second split (two panes). This will resize pane A and spawn pane B.
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(600))
+
+        // Ensure pane B is focused (pane A unfocused).
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.75)).click()
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Wait longer than attention-on-output-idle.
+        try await Task.sleep(for: .seconds(2))
+
+        // Sample pixels on pane A's left edge: if the bell border is active, these tend
+        // to be yellow-ish.
+        let shot = window.screenshot()
+        let samples = [
+            rgbAtNormalizedPoint(shot.image, x: 0.02, y: 0.45),
+            rgbAtNormalizedPoint(shot.image, x: 0.02, y: 0.55),
+            rgbAtNormalizedPoint(shot.image, x: 0.02, y: 0.65),
+        ]
+
+        XCTAssertFalse(
+            samples.contains(where: looksLikeBellBorder),
+            "Expected pane A to NOT show attention border from splitting alone. samples=\(samples)"
         )
     }
 

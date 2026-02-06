@@ -767,6 +767,28 @@ class BaseTerminalController: NSWindowController,
         // Auto-focus is macOS-only behavior and opt-in via config.
         guard ghostty.config.autoFocusAttention else { return }
 
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard let targetWindow = target.window else { return }
+
+        // "Current window only": keep this within the current window's tab group.
+        if let myGroup = window?.tabGroup, let targetGroup = targetWindow.tabGroup {
+            guard myGroup === targetGroup else {
+                if ghostty.config.attentionDebug {
+                    let msg = "attention autofocusing ignored reason=otherTabGroup myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                return
+            }
+        } else {
+            guard targetWindow === window else {
+                if ghostty.config.attentionDebug {
+                    let msg = "attention autofocusing ignored reason=otherWindow myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                return
+            }
+        }
+
         // Suppressed when Ghostty isn't frontmost.
         guard NSApp.isActive else {
             if ghostty.config.attentionDebug {
@@ -790,28 +812,6 @@ class BaseTerminalController: NSWindowController,
                 Ghostty.logger.info("\(msg, privacy: .public)")
             }
             return
-        }
-
-        guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard let targetWindow = target.window else { return }
-
-        // "Current window only": keep this within the current window's tab group.
-        if let myGroup = window?.tabGroup, let targetGroup = targetWindow.tabGroup {
-            guard myGroup === targetGroup else {
-                if ghostty.config.attentionDebug {
-                    let msg = "attention autofocusing ignored reason=otherTabGroup myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
-                    Ghostty.logger.info("\(msg, privacy: .public)")
-                }
-                return
-            }
-        } else {
-            guard targetWindow === window else {
-                if ghostty.config.attentionDebug {
-                    let msg = "attention autofocusing ignored reason=otherWindow myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
-                    Ghostty.logger.info("\(msg, privacy: .public)")
-                }
-                return
-            }
         }
 
         if ghostty.config.attentionDebug {
@@ -1486,6 +1486,7 @@ class BaseTerminalController: NSWindowController,
         // Becoming/losing key means we have to notify our surface(s) that we have focus
         // so things like cursors blink, pty events are sent, etc.
         self.syncFocusToSurfaceTree()
+
     }
 
     func windowDidResignKey(_ notification: Notification) {

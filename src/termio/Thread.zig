@@ -80,6 +80,7 @@ output_idle_c: xev.Completion = .{},
 output_idle_cancel_c: xev.Completion = .{},
 output_idle_armed: bool = false,
 output_idle_last_output: ?std.time.Instant = null,
+output_idle_last_resize: ?std.time.Instant = null,
 
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
@@ -333,7 +334,13 @@ fn drainMailbox(
                 try io.changeConfig(data, config.ptr);
             },
             .inspector => |v| self.flags.has_inspector = v,
-            .resize => |v| self.handleResize(cb, v),
+            .resize => |v| {
+                // Resizes (including split creation) often trigger prompt redraw output
+                // from interactive programs. We treat that output as non-actionable for
+                // output-idle attention.
+                self.output_idle_last_resize = std.time.Instant.now() catch null;
+                self.handleResize(cb, v);
+            },
             .size_report => |v| try io.sizeReport(data, v),
             .clear_screen => |v| try io.clearScreen(data, v.history),
             .scroll_viewport => |v| try io.scrollViewport(v),
@@ -384,6 +391,22 @@ fn drainMailbox(
                         log.info("output-idle ignore reason=focused", .{});
                     }
                     continue;
+                }
+
+                // Ignore output-idle attention arming immediately after a resize. Splits
+                // and window resizes often cause interactive shells to redraw prompts
+                // (SIGWINCH), which is "output" but not a useful attention signal.
+                if (self.output_idle_last_resize) |last_resize| {
+                    const now = std.time.Instant.now() catch null;
+                    if (now) |t| {
+                        const since = t.since(last_resize);
+                        if (since < (250 * std.time.ns_per_ms)) {
+                            if (io.config.attention_debug) {
+                                log.info("output-idle ignore reason=recent_resize since_ms={}", .{since / std.time.ns_per_ms});
+                            }
+                            continue;
+                        }
+                    }
                 }
 
                 self.output_idle_armed = true;
