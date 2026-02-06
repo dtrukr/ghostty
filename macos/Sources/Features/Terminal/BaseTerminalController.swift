@@ -93,6 +93,16 @@ class BaseTerminalController: NSWindowController,
     /// The last computed title from the focused surface (without the override).
     private var lastComputedTitle: String = "👻"
 
+    /// Most recent user activity time (seconds since boot). Used to gate auto-focus.
+    private var lastUserActivityUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+
+    /// Debounce state for auto-focus-attention.
+    private var autoFocusAttentionWorkItem: DispatchWorkItem? = nil
+
+    /// Last cycled attention surface per tab group, so cycling continues smoothly
+    /// when it crosses tabs.
+    private static var attentionCycleState: [ObjectIdentifier: UUID] = [:]
+
     /// The time that undo/redo operations that contain running ptys are valid for.
     var undoExpiration: Duration {
         ghostty.config.undoTimeout
@@ -202,14 +212,26 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyDidGotoAttention(_:)),
+            name: Ghostty.Notification.ghosttyGotoAttention,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(ghosttySurfaceDragEndedNoTarget(_:)),
             name: .ghosttySurfaceDragEndedNoTarget,
+            object: nil)
+
+        // Attention marks (bell/notifications). Used for auto-focus-attention.
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyBellDidRing(_:)),
+            name: .ghosttyBellDidRing,
             object: nil)
 
         // Listen for local events that we need to know of outside of
         // single surface handlers.
         self.eventMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.flagsChanged]
+            matching: [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]
         ) { [weak self] event in self?.localEventHandler(event) }
     }
 
@@ -726,6 +748,79 @@ class BaseTerminalController: NSWindowController,
         target.highlight()
     }
 
+    @objc private func ghosttyDidGotoAttention(_ notification: Notification) {
+        guard let source = notification.object as? Ghostty.SurfaceView else { return }
+        guard let dirAny = notification.userInfo?[Ghostty.Notification.AttentionDirectionKey] else { return }
+        guard let direction = dirAny as? Ghostty.AttentionFocusDirection else { return }
+
+        // Only handle this action for the controller that owns the source surface.
+        guard surfaceTree.contains(source) else { return }
+
+        if ghostty.config.attentionDebug {
+            let msg = "attention goto received controllerWindow=\(self.window?.windowNumber ?? -1) source=\(source.id.uuidString) direction=\(String(describing: direction))"
+            Ghostty.logger.info("\(msg, privacy: .public)")
+        }
+        cycleAttention(direction: direction, preferCurrentTab: true)
+    }
+
+    @objc private func ghosttyBellDidRing(_ notification: Notification) {
+        // Auto-focus is macOS-only behavior and opt-in via config.
+        guard ghostty.config.autoFocusAttention else { return }
+
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard let targetWindow = target.window else { return }
+
+        // "Current window only": keep this within the current window's tab group.
+        if let myGroup = window?.tabGroup, let targetGroup = targetWindow.tabGroup {
+            guard myGroup === targetGroup else {
+                if ghostty.config.attentionDebug {
+                    let msg = "attention autofocusing ignored reason=otherTabGroup myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                return
+            }
+        } else {
+            guard targetWindow === window else {
+                if ghostty.config.attentionDebug {
+                    let msg = "attention autofocusing ignored reason=otherWindow myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                return
+            }
+        }
+
+        // Suppressed when Ghostty isn't frontmost.
+        guard NSApp.isActive else {
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing suppressed reason=appInactive"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            return
+        }
+
+        // Only auto-focus from the key window for this tab group.
+        guard window?.isKeyWindow ?? false else {
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing suppressed reason=windowNotKey window=\(self.window?.windowNumber ?? -1)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            return
+        }
+        guard !commandPaletteIsShowing else {
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing suppressed reason=commandPalette"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            return
+        }
+
+        if ghostty.config.attentionDebug {
+            let msg = "attention autofocusing scheduled target=\(target.id.uuidString) window=\(targetWindow.windowNumber)"
+            Ghostty.logger.info("\(msg, privacy: .public)")
+        }
+        scheduleAutoFocusAttention()
+    }
+
     @objc private func ghosttySurfaceDragEndedNoTarget(_ notification: Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard let targetNode = surfaceTree.root?.node(view: target) else { return }
@@ -762,16 +857,183 @@ class BaseTerminalController: NSWindowController,
             confirmUndo: false)
     }
 
+    private func scheduleAutoFocusAttention() {
+        autoFocusAttentionWorkItem?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.attemptAutoFocusAttention()
+        }
+        autoFocusAttentionWorkItem = work
+
+        let idleMs = ghostty.config.autoFocusAttentionIdle
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(idleMs)),
+            execute: work
+        )
+    }
+
+    private func attemptAutoFocusAttention() {
+        guard ghostty.config.autoFocusAttention else { return }
+        guard NSApp.isActive else { return }
+        guard window?.isKeyWindow ?? false else { return }
+        guard !commandPaletteIsShowing else { return }
+
+        let idleMs = Double(ghostty.config.autoFocusAttentionIdle)
+        let elapsedMs = (ProcessInfo.processInfo.systemUptime - lastUserActivityUptime) * 1000.0
+        if elapsedMs < idleMs {
+            // Not idle yet; reschedule for the remaining time.
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing idleWait elapsedMs=\(Int(elapsedMs)) idleMs=\(Int(idleMs)) remainingMs=\(Int(max(0.0, idleMs - elapsedMs)))"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            let remainingMs = max(0.0, idleMs - elapsedMs)
+            autoFocusAttentionWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.attemptAutoFocusAttention() }
+            autoFocusAttentionWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(remainingMs)), execute: work)
+            return
+        }
+
+        focusMostRecentAttentionAcrossTabGroup()
+    }
+
+    private func focusMostRecentAttentionAcrossTabGroup() {
+        guard let (controller, surface) = mostRecentAttentionSurface(preferCurrentTab: false) else {
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing noCandidates"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            return
+        }
+        if ghostty.config.attentionDebug {
+            let msg = "attention autofocusing focus surface=\(surface.id.uuidString) fromWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(surface.window?.windowNumber ?? -1)"
+            Ghostty.logger.info("\(msg, privacy: .public)")
+        }
+        controller.focusSurface(surface)
+    }
+
+    private func cycleAttention(direction: Ghostty.AttentionFocusDirection, preferCurrentTab: Bool) {
+        guard let window else { return }
+
+        let candidates: [Ghostty.SurfaceView]
+        if preferCurrentTab {
+            let local = attentionSurfaces(in: self)
+            if !local.isEmpty {
+                candidates = sortAttentionSurfaces(local)
+            } else {
+                candidates = sortAttentionSurfaces(attentionSurfacesAcrossTabGroup())
+            }
+        } else {
+            candidates = sortAttentionSurfaces(attentionSurfacesAcrossTabGroup())
+        }
+
+        guard !candidates.isEmpty else {
+            if ghostty.config.attentionDebug {
+                let msg = "attention cycle noCandidates preferCurrentTab=\(preferCurrentTab)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            return
+        }
+
+        let groupId = ObjectIdentifier(window.tabGroup ?? window)
+        let lastId = Self.attentionCycleState[groupId]
+
+        let next: Ghostty.SurfaceView = {
+            if let lastId,
+               let idx = candidates.firstIndex(where: { $0.id == lastId }) {
+                switch direction {
+                case .next:
+                    return candidates[(idx + 1) % candidates.count]
+                case .previous:
+                    return candidates[(idx - 1 + candidates.count) % candidates.count]
+                }
+            }
+
+            // No prior cycle state: start at most-recent (next) or least-recent (previous).
+            switch direction {
+            case .next:
+                return candidates[0]
+            case .previous:
+                return candidates[candidates.count - 1]
+            }
+        }()
+
+        Self.attentionCycleState[groupId] = next.id
+
+        if ghostty.config.attentionDebug {
+            let lastStr = lastId?.uuidString ?? "nil"
+            let msg = "attention cycle pick direction=\(String(describing: direction)) preferCurrentTab=\(preferCurrentTab) candidates=\(candidates.count) last=\(lastStr) next=\(next.id.uuidString) targetWindow=\(next.window?.windowNumber ?? -1)"
+            Ghostty.logger.info("\(msg, privacy: .public)")
+        }
+        guard let targetWindow = next.window,
+              let targetController = targetWindow.windowController as? BaseTerminalController
+        else { return }
+        targetController.focusSurface(next)
+    }
+
+    private func attentionSurfaces(in controller: BaseTerminalController) -> [Ghostty.SurfaceView] {
+        controller.surfaceTree.filter { $0.bell }
+    }
+
+    private func attentionSurfacesAcrossTabGroup() -> [Ghostty.SurfaceView] {
+        guard let window else { return [] }
+        let windows: [NSWindow] = window.tabGroup?.windows ?? [window]
+        return windows
+            .compactMap { $0.windowController as? BaseTerminalController }
+            .flatMap { attentionSurfaces(in: $0) }
+    }
+
+    private func sortAttentionSurfaces(_ surfaces: [Ghostty.SurfaceView]) -> [Ghostty.SurfaceView] {
+        // Most recent first.
+        return surfaces.sorted { a, b in
+            let ai = a.bellInstant ?? -Double.greatestFiniteMagnitude
+            let bi = b.bellInstant ?? -Double.greatestFiniteMagnitude
+            if ai != bi { return ai > bi }
+            return a.id.uuidString < b.id.uuidString
+        }
+    }
+
+    private func mostRecentAttentionSurface(preferCurrentTab: Bool) -> (BaseTerminalController, Ghostty.SurfaceView)? {
+        guard let window else { return nil }
+
+        func pick(from surfaces: [Ghostty.SurfaceView]) -> (BaseTerminalController, Ghostty.SurfaceView)? {
+            guard let best = sortAttentionSurfaces(surfaces).first else { return nil }
+            guard let targetWindow = best.window,
+                  let controller = targetWindow.windowController as? BaseTerminalController
+            else { return nil }
+            return (controller, best)
+        }
+
+        if preferCurrentTab {
+            if let local = pick(from: attentionSurfaces(in: self)) {
+                return local
+            }
+        }
+
+        // For auto-focus we want the most recent across the entire tab group.
+        return pick(from: attentionSurfacesAcrossTabGroup())
+    }
+
     // MARK: Local Events
 
     private func localEventHandler(_ event: NSEvent) -> NSEvent? {
-        return switch event.type {
+        switch event.type {
         case .flagsChanged:
-            localEventFlagsChanged(event)
+            return localEventFlagsChanged(event)
+
+        case .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
+            noteUserActivity(event)
+            return event
 
         default:
-            event
+            return event
         }
+    }
+
+    private func noteUserActivity(_ event: NSEvent) {
+        // Only track activity for events targeting our window.
+        guard let window, event.window == window else { return }
+        lastUserActivityUptime = ProcessInfo.processInfo.systemUptime
     }
 
     private func localEventFlagsChanged(_ event: NSEvent) -> NSEvent? {
@@ -1224,6 +1486,7 @@ class BaseTerminalController: NSWindowController,
         // Becoming/losing key means we have to notify our surface(s) that we have focus
         // so things like cursors blink, pty events are sent, etc.
         self.syncFocusToSurfaceTree()
+
     }
 
     func windowDidResignKey(_ notification: Notification) {

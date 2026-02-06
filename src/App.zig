@@ -313,6 +313,22 @@ pub fn focusEvent(self: *App, focused: bool) void {
 
     log.debug("focus event focused={}", .{focused});
     self.focused = focused;
+
+    // When the app loses focus, no surfaces should be considered focused for terminal
+    // semantics. Some runtimes only provide app-level focus events (or may not reliably
+    // deliver per-surface focus changes during transitions), but core features such as
+    // output-idle attention depend on an accurate focused state.
+    //
+    // When focus is regained, the runtime is expected to re-focus the correct surface(s).
+    if (!focused) {
+        for (self.surfaces.items) |rt_surface| {
+            // Clear focused state on all surfaces. (Only one should be focused, but this
+            // keeps us robust to runtime mismatches.)
+            rt_surface.core().focusCallback(false) catch |err| {
+                log.warn("error clearing surface focus on app focus loss err={}", .{err});
+            };
+        }
+    }
 }
 
 /// Returns true if the given key event would trigger a keybinding

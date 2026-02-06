@@ -25,6 +25,7 @@ pub fn init(
     b: *std.Build,
     config: *const Config,
     deps: Deps,
+    only_testing: ?[]const u8,
 ) !Ghostty {
     const xc_config = switch (config.optimize) {
         .Debug => "Debug",
@@ -105,6 +106,9 @@ pub fn init(
             "-scheme",
             "Ghostty",
         });
+        if (only_testing) |only| {
+            step.addArg(b.fmt("-only-testing:{s}", .{only}));
+        }
         if (xc_arch) |arch| step.addArgs(&.{ "-arch", arch });
 
         // We need the xcframework

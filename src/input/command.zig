@@ -506,6 +506,19 @@ fn actionCommands(action: Action.Key) []const Command {
             },
         },
 
+        .goto_attention => comptime &.{
+            .{
+                .action = .{ .goto_attention = .previous },
+                .title = "Focus Attention: Previous",
+                .description = "Focus the previous pane that needs attention, if any.",
+            },
+            .{
+                .action = .{ .goto_attention = .next },
+                .title = "Focus Attention: Next",
+                .description = "Focus the next pane that needs attention, if any.",
+            },
+        },
+
         .goto_window => comptime &.{
             .{
                 .action = .{ .goto_window = .previous },

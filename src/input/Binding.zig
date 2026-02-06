@@ -601,6 +601,14 @@ pub const Action = union(enum) {
     /// (`previous` and `next`).
     goto_split: SplitFocusDirection,
 
+    /// Focus the next/previous surface that needs attention (bell/notifications),
+    /// cycling within the current window/tab group.
+    ///
+    /// Valid arguments: `previous`, `next`
+    ///
+    /// Only implemented on macOS.
+    goto_attention: AttentionFocusDirection,
+
     /// Focus on either the previous window or the next one ('previous', 'next')
     goto_window: GotoWindow,
 
@@ -1038,6 +1046,11 @@ pub const Action = union(enum) {
         }
     };
 
+    pub const AttentionFocusDirection = enum {
+        previous,
+        next,
+    };
+
     pub const SplitResizeDirection = enum {
         up,
         down,
@@ -1376,6 +1389,7 @@ pub const Action = union(enum) {
             .toggle_tab_overview,
             .new_split,
             .goto_split,
+            .goto_attention,
             .goto_window,
             .toggle_split_zoom,
             .toggle_readonly,
@@ -3462,6 +3476,31 @@ test "parse: sequences" {
             .action = .{ .ignore = {} },
         } }, (try p.next()).?);
         try testing.expect(try p.next() == null);
+    }
+}
+
+test "parse: goto_attention" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        Action{ .goto_attention = .next },
+        try Action.parse("goto_attention:next"),
+    );
+    try testing.expectEqual(
+        Action{ .goto_attention = .previous },
+        try Action.parse("goto_attention:previous"),
+    );
+
+    try testing.expectError(error.InvalidFormat, Action.parse("goto_attention"));
+    try testing.expectError(error.InvalidFormat, Action.parse("goto_attention:"));
+    try testing.expectError(error.InvalidFormat, Action.parse("goto_attention:nope"));
+
+    // Ensure round-tripping via formatter works.
+    {
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+        try (Action{ .goto_attention = .next }).format(&buf.writer);
+        try testing.expectEqualStrings("goto_attention:next", buf.written());
     }
 }
 

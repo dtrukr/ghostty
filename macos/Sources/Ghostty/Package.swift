@@ -191,6 +191,21 @@ extension Ghostty {
         }
     }
 
+    enum AttentionFocusDirection {
+        case previous, next
+
+        static func from(direction: ghostty_action_goto_attention_e) -> Self? {
+            switch (direction) {
+            case GHOSTTY_GOTO_ATTENTION_PREVIOUS:
+                return .previous
+            case GHOSTTY_GOTO_ATTENTION_NEXT:
+                return .next
+            default:
+                return nil
+            }
+        }
+    }
+
     /// Enum used for resizing splits. This is the direction the split divider will move.
     enum SplitResizeDirection {
         case up, down, left, right
@@ -440,6 +455,10 @@ extension Ghostty.Notification {
     /// Focus previous/next split. Has a SplitFocusDirection in the userinfo.
     static let ghosttyFocusSplit = Notification.Name("com.mitchellh.ghostty.focusSplit")
     static let SplitDirectionKey = ghosttyFocusSplit.rawValue
+
+    /// Focus previous/next surface that needs attention. Has an attention direction in the userinfo.
+    static let ghosttyGotoAttention = Notification.Name("com.mitchellh.ghostty.gotoAttention")
+    static let AttentionDirectionKey = ghosttyGotoAttention.rawValue
 
     /// Goto tab. Has tab index in the userinfo.
     static let ghosttyGotoTab = Notification.Name("com.mitchellh.ghostty.gotoTab")

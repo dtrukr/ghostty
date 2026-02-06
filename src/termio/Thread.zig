@@ -19,6 +19,7 @@ const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const termio = @import("../termio.zig");
 const renderer = @import("../renderer.zig");
+const apprt = @import("../apprt.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.io_thread);
@@ -72,6 +73,15 @@ sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
 
+/// When enabled, this timer is used to mark attention when an unfocused surface
+/// has been quiet for a short period after producing output.
+output_idle: xev.Timer,
+output_idle_c: xev.Completion = .{},
+output_idle_cancel_c: xev.Completion = .{},
+output_idle_armed: bool = false,
+output_idle_last_output: ?std.time.Instant = null,
+output_idle_last_resize: ?std.time.Instant = null,
+
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
     /// tells our mailbox system to drain and ignore all messages.
@@ -111,6 +121,10 @@ pub fn init(
     var sync_reset_h = try xev.Timer.init();
     errdefer sync_reset_h.deinit();
 
+    // This timer is used for output-idle attention.
+    var output_idle_h = try xev.Timer.init();
+    errdefer output_idle_h.deinit();
+
     return Thread{
         .alloc = alloc,
         .loop = loop,
@@ -118,6 +132,7 @@ pub fn init(
         .scroll = scroll_h,
         .coalesce = coalesce_h,
         .sync_reset = sync_reset_h,
+        .output_idle = output_idle_h,
     };
 }
 
@@ -127,6 +142,7 @@ pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
     self.sync_reset.deinit();
+    self.output_idle.deinit();
     self.stop.deinit();
     self.loop.deinit();
 }
@@ -318,7 +334,13 @@ fn drainMailbox(
                 try io.changeConfig(data, config.ptr);
             },
             .inspector => |v| self.flags.has_inspector = v,
-            .resize => |v| self.handleResize(cb, v),
+            .resize => |v| {
+                // Resizes (including split creation) often trigger prompt redraw output
+                // from interactive programs. We treat that output as non-actionable for
+                // output-idle attention.
+                self.output_idle_last_resize = std.time.Instant.now() catch null;
+                self.handleResize(cb, v);
+            },
             .size_report => |v| try io.sizeReport(data, v),
             .clear_screen => |v| try io.clearScreen(data, v.history),
             .scroll_viewport => |v| try io.scrollViewport(v),
@@ -332,7 +354,79 @@ fn drainMailbox(
             .jump_to_prompt => |v| try io.jumpToPrompt(v),
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
-            .focused => |v| try io.focusGained(data, v),
+            .focused => |v| {
+                try io.focusGained(data, v);
+
+                // If focus was regained, cancel any pending output-idle attention.
+                if (v) {
+                    if (io.config.attention_debug and self.output_idle_armed) {
+                        log.info("output-idle disarm reason=focus", .{});
+                    }
+                    self.output_idle_armed = false;
+                    self.output_idle_last_output = null;
+                    if (self.output_idle_c.state() == .active and
+                        self.output_idle_cancel_c.state() == .dead)
+                    {
+                        self.output_idle.cancel(
+                            &self.loop,
+                            &self.output_idle_c,
+                            &self.output_idle_cancel_c,
+                            CallbackData,
+                            cb,
+                            outputIdleCancelCallback,
+                        );
+                    }
+                }
+            },
+            .output_activity => |v| {
+                // Only schedule if enabled and the output occurred while unfocused.
+                const dur = io.config.attention_on_output_idle orelse {
+                    if (io.config.attention_debug) {
+                        log.info("output-idle ignore reason=disabled", .{});
+                    }
+                    continue;
+                };
+                if (v.focused) {
+                    if (io.config.attention_debug) {
+                        log.info("output-idle ignore reason=focused", .{});
+                    }
+                    continue;
+                }
+
+                // Ignore output-idle attention arming immediately after a resize. Splits
+                // and window resizes often cause interactive shells to redraw prompts
+                // (SIGWINCH), which is "output" but not a useful attention signal.
+                if (self.output_idle_last_resize) |last_resize| {
+                    const now = std.time.Instant.now() catch null;
+                    if (now) |t| {
+                        const since = t.since(last_resize);
+                        if (since < (250 * std.time.ns_per_ms)) {
+                            if (io.config.attention_debug) {
+                                log.info("output-idle ignore reason=recent_resize since_ms={}", .{since / std.time.ns_per_ms});
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                self.output_idle_armed = true;
+                self.output_idle_last_output = std.time.Instant.now() catch null;
+
+                // Reset to fire after the configured quiet period.
+                const ms: u64 = @max(1, dur.duration / std.time.ns_per_ms);
+                if (io.config.attention_debug) {
+                    log.info("output-idle arm quiet_ms={}", .{ms});
+                }
+                self.output_idle.reset(
+                    &self.loop,
+                    &self.output_idle_c,
+                    &self.output_idle_cancel_c,
+                    @intCast(ms),
+                    CallbackData,
+                    cb,
+                    outputIdleCallback,
+                );
+            },
             .write_small => |v| try io.queueWrite(
                 data,
                 v.data[0..v.len],
@@ -359,6 +453,93 @@ fn drainMailbox(
     if (redraw) {
         try io.renderer_wakeup.notify();
     }
+}
+
+fn outputIdleCallback(
+    cb_: ?*CallbackData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error during output idle callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const cb = cb_ orelse return .disarm;
+    const self = cb.self;
+    const io = cb.io;
+
+    if (!self.output_idle_armed) return .disarm;
+
+    const dur = io.config.attention_on_output_idle orelse return .disarm;
+    const last = self.output_idle_last_output orelse return .disarm;
+
+    const now = std.time.Instant.now() catch return .disarm;
+    if (now.since(last) < dur.duration) {
+        // Shouldn't happen often (reset should align), but if we fired early
+        // due to scheduling jitter, re-arm for the remainder.
+        const remaining_ns = dur.duration - now.since(last);
+        const ms: u64 = @max(1, remaining_ns / std.time.ns_per_ms);
+        if (io.config.attention_debug) {
+            log.info("output-idle fired early remaining_ms={}", .{ms});
+        }
+        self.output_idle.reset(
+            &self.loop,
+            &self.output_idle_c,
+            &self.output_idle_cancel_c,
+            @intCast(ms),
+            CallbackData,
+            cb,
+            outputIdleCallback,
+        );
+        return .disarm;
+    }
+
+    self.output_idle_armed = false;
+
+    if (io.config.attention_debug) {
+        log.info("output-idle fired ok", .{});
+        log.info("attention mark source=output_idle", .{});
+    }
+
+    // Push a surface message that will become a runtime action on the surface thread.
+    const msg: apprt.surface.Message = .{
+        .mark_attention = .{ .source = .output_idle },
+    };
+    if (io.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+        _ = io.surface_mailbox.push(msg, .{ .forever = {} });
+    }
+
+    return .disarm;
+}
+
+fn outputIdleCancelCallback(
+    _: ?*CallbackData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.CancelError!void,
+) xev.CallbackAction {
+    // Normalize platform differences.
+    const CancelError = xev.Timer.CancelError || error{
+        Canceled,
+        NotFound,
+        Unexpected,
+    };
+
+    _ = r catch |err| switch (@as(CancelError, @errorCast(err))) {
+        error.Canceled => {}, // success
+        error.NotFound => {}, // completed before it could cancel
+        else => {
+            log.warn("error in output idle cancel callback err={}", .{err});
+            unreachable;
+        },
+    };
+
+    return .disarm;
 }
 
 fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {

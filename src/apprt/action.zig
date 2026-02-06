@@ -290,6 +290,15 @@ pub const Action = union(Key) {
     /// it needs to ring the bell. This is usually a sound or visual effect.
     ring_bell,
 
+    /// Mark a surface as needing attention without necessarily emitting a bell.
+    ///
+    /// This is currently macOS-only and is used by core-driven attention
+    /// sources (e.g. output-idle detection) that want the same attention
+    /// visuals and attention cycling behavior as BEL.
+    ///
+    /// macOS only.
+    mark_attention: MarkAttention,
+
     /// Undo the last action. See the "undo" keybinding for more
     /// details on what can and cannot be undone.
     undo,
@@ -332,6 +341,19 @@ pub const Action = union(Key) {
 
     /// The readonly state of the surface has changed.
     readonly: Readonly,
+
+    /// Jump to the next/previous surface that needs attention.
+    ///
+    /// macOS only.
+    goto_attention: GotoAttention,
+
+    pub const MarkAttention = extern struct {
+        source: Source,
+
+        pub const Source = enum(c_int) {
+            output_idle = 0,
+        };
+    };
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -386,6 +408,7 @@ pub const Action = union(Key) {
         config_change,
         close_window,
         ring_bell,
+        mark_attention,
         undo,
         redo,
         check_for_updates,
@@ -399,6 +422,7 @@ pub const Action = union(Key) {
         search_total,
         search_selected,
         readonly,
+        goto_attention,
     };
 
     /// Sync with: ghostty_action_u
@@ -492,6 +516,13 @@ pub const GotoSplit = enum(c_int) {
     left,
     down,
     right,
+};
+
+// This is made extern (c_int) to make interop easier with our embedded
+// runtime. The small size cost doesn't make a difference in our union.
+pub const GotoAttention = enum(c_int) {
+    previous,
+    next,
 };
 
 // This is made extern (c_int) to make interop easier with our embedded

@@ -171,6 +171,13 @@ pub const DerivedConfig = struct {
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
 
+    /// When set, marks attention after an unfocused surface becomes quiet for
+    /// this duration following output activity.
+    attention_on_output_idle: ?configpkg.Config.Duration,
+
+    /// Debug logging for attention/auto-focus (used by some runtimes).
+    attention_debug: bool,
+
     pub fn init(
         alloc_gpa: Allocator,
         config: *const configpkg.Config,
@@ -195,6 +202,8 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
+            .attention_on_output_idle = config.@"attention-on-output-idle",
+            .attention_debug = config.@"attention-debug",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -690,6 +699,12 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
+
+    // If enabled, inform the IO thread event loop that we saw output while
+    // unfocused so it can start/reset the output-idle attention timer.
+    if (self.config.attention_on_output_idle != null and !self.terminal.flags.focused) {
+        self.queueMessage(.{ .output_activity = .{ .focused = false } }, .locked);
+    }
 
     // Whenever a character is typed, we ensure the cursor is in the
     // non-blink state so it is rendered if visible. If we're under

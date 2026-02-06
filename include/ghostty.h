@@ -542,6 +542,22 @@ typedef enum {
   GHOSTTY_GOTO_SPLIT_RIGHT,
 } ghostty_action_goto_split_e;
 
+// apprt.action.GotoAttention
+typedef enum {
+  GHOSTTY_GOTO_ATTENTION_PREVIOUS,
+  GHOSTTY_GOTO_ATTENTION_NEXT,
+} ghostty_action_goto_attention_e;
+
+// apprt.action.MarkAttention.Source
+typedef enum {
+  GHOSTTY_MARK_ATTENTION_SOURCE_OUTPUT_IDLE = 0,
+} ghostty_action_mark_attention_source_e;
+
+// apprt.action.MarkAttention
+typedef struct {
+  ghostty_action_mark_attention_source_e source;
+} ghostty_action_mark_attention_s;
+
 // apprt.action.GotoWindow
 typedef enum {
   GHOSTTY_GOTO_WINDOW_PREVIOUS,
@@ -897,6 +913,7 @@ typedef enum {
   GHOSTTY_ACTION_CONFIG_CHANGE,
   GHOSTTY_ACTION_CLOSE_WINDOW,
   GHOSTTY_ACTION_RING_BELL,
+  GHOSTTY_ACTION_MARK_ATTENTION,
   GHOSTTY_ACTION_UNDO,
   GHOSTTY_ACTION_REDO,
   GHOSTTY_ACTION_CHECK_FOR_UPDATES,
@@ -910,6 +927,7 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_TOTAL,
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
+  GHOSTTY_ACTION_GOTO_ATTENTION,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -918,6 +936,7 @@ typedef union {
   ghostty_action_move_tab_s move_tab;
   ghostty_action_goto_tab_e goto_tab;
   ghostty_action_goto_split_e goto_split;
+  ghostty_action_goto_attention_e goto_attention;
   ghostty_action_goto_window_e goto_window;
   ghostty_action_resize_split_s resize_split;
   ghostty_action_size_limit_s size_limit;
@@ -951,6 +970,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_mark_attention_s mark_attention;
 } ghostty_action_u;
 
 typedef struct {
