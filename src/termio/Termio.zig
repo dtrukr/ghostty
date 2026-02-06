@@ -162,6 +162,10 @@ pub const DerivedConfig = struct {
     cursor_color: ?configpkg.Config.TerminalColor,
     foreground: configpkg.Config.Color,
     background: configpkg.Config.Color,
+    minimum_contrast: f64,
+    smart_background: bool,
+    smart_background_key: configpkg.SmartBackgroundKey,
+    smart_background_strength: f32,
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
@@ -183,6 +187,10 @@ pub const DerivedConfig = struct {
             .cursor_color = config.@"cursor-color",
             .foreground = config.foreground,
             .background = config.background,
+            .minimum_contrast = config.@"minimum-contrast",
+            .smart_background = config.@"smart-background",
+            .smart_background_key = config.@"smart-background-key",
+            .smart_background_strength = @floatCast(config.@"smart-background-strength"),
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
@@ -281,6 +289,12 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .enquiry_response = opts.config.enquiry_response,
         .default_cursor_style = opts.config.cursor_style,
         .default_cursor_blink = opts.config.cursor_blink,
+        .smart_background_enabled = opts.config.smart_background,
+        .smart_background_key = opts.config.smart_background_key,
+        .smart_background_strength = opts.config.smart_background_strength,
+        .smart_background_min_contrast = opts.config.minimum_contrast,
+        .smart_base_background = opts.config.background.toTerminalRGB(),
+        .smart_base_foreground = opts.config.foreground.toTerminalRGB(),
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -302,6 +316,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
     };
+
+    // Apply smart background tinting (if enabled) using the initial pwd that
+    // may have been set by the exec backend.
+    self.terminal_stream.handler.smartBackgroundInit();
 }
 
 pub fn deinit(self: *Termio) void {
@@ -457,6 +475,9 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
             config.image_storage_limit,
         );
     }
+
+    // Re-apply any smart background tinting using the updated base colors.
+    self.terminal_stream.handler.smartBackgroundReapply();
 }
 
 /// Resize the terminal.

@@ -750,6 +750,7 @@ pub const Application = extern struct {
             .render_inspector,
             .renderer_health,
             .color_change,
+            .smart_background_key,
             .reset_window_size,
             .check_for_updates,
             .undo,

@@ -637,6 +637,11 @@ typedef struct {
   const char* pwd;
 } ghostty_action_pwd_s;
 
+// apprt.action.SmartBackgroundKey.C
+typedef struct {
+  const char* key;
+} ghostty_action_smart_background_key_s;
+
 // terminal.MouseShape
 typedef enum {
   GHOSTTY_MOUSE_SHAPE_DEFAULT,
@@ -876,6 +881,7 @@ typedef enum {
   GHOSTTY_ACTION_SET_TITLE,
   GHOSTTY_ACTION_PROMPT_TITLE,
   GHOSTTY_ACTION_PWD,
+  GHOSTTY_ACTION_SMART_BACKGROUND_KEY,
   GHOSTTY_ACTION_MOUSE_SHAPE,
   GHOSTTY_ACTION_MOUSE_VISIBILITY,
   GHOSTTY_ACTION_MOUSE_OVER_LINK,
@@ -923,6 +929,7 @@ typedef union {
   ghostty_action_set_title_s set_title;
   ghostty_action_prompt_title_e prompt_title;
   ghostty_action_pwd_s pwd;
+  ghostty_action_smart_background_key_s smart_background_key;
   ghostty_action_mouse_shape_e mouse_shape;
   ghostty_action_mouse_visibility_e mouse_visibility;
   ghostty_action_mouse_over_link_s mouse_over_link;

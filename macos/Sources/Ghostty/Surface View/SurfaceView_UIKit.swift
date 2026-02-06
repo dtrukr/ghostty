@@ -17,6 +17,9 @@ extension Ghostty {
         // The current pwd of the surface.
         @Published var pwd: String? = nil
 
+        // The current smart background key label for this surface.
+        @Published var smartBackgroundKey: String? = nil
+
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.
         // when the font size changes). This is used to allow windows to be

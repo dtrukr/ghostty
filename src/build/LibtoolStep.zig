@@ -3,6 +3,7 @@
 const LibtoolStep = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Step = std.Build.Step;
 const RunStep = std.Build.Step.Run;
 const LazyPath = std.Build.LazyPath;
@@ -31,7 +32,11 @@ pub fn create(b: *std.Build, opts: Options) *LibtoolStep {
     const self = b.allocator.create(LibtoolStep) catch @panic("OOM");
 
     const run_step = RunStep.create(b, b.fmt("libtool {s}", .{opts.name}));
-    run_step.addArgs(&.{ "libtool", "-static", "-o" });
+    const libtool_cmd: []const u8 = switch (builtin.os.tag) {
+        .macos, .ios => "/usr/bin/libtool",
+        else => "libtool",
+    };
+    run_step.addArgs(&.{ libtool_cmd, "-static", "-o" });
     const output = run_step.addOutputFileArg(opts.out_name);
     for (opts.sources) |source| run_step.addFileArg(source);
 
