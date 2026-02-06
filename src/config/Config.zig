@@ -1185,10 +1185,9 @@ command: ?Command = null,
 /// On GTK, there is a context menu item that will enable command finished
 /// notifications for a single command, overriding the `never` and `unfocused`
 /// options.
+/// This context menu item is GTK only.
 ///
-/// GTK only.
-///
-/// Available since 1.3.0.
+/// Available since 1.3.0 (GTK), 1.4.0 (macOS).
 @"notify-on-command-finish": NotifyOnCommandFinish = .never,
 
 /// If command finished notifications are enabled, this controls how the user is
@@ -1202,9 +1201,7 @@ command: ?Command = null,
 /// Options can be combined by listing them as a comma separated list. Options
 /// can be negated by prefixing them with `no-`. For example `no-bell,notify`.
 ///
-/// GTK only.
-///
-/// Available since 1.3.0.
+/// Available since 1.3.0 (GTK), 1.4.0 (macOS).
 @"notify-on-command-finish-action": NotifyOnCommandFinishAction = .{
     .bell = true,
     .notify = false,
@@ -1241,10 +1238,65 @@ command: ?Command = null,
 /// The maximum value is `584y 49w 23h 34m 33s 709ms 551µs 615ns`. Any
 /// value larger than this will be clamped to the maximum value.
 ///
-/// GTK only.
-///
-/// Available since 1.3.0
+/// Available since 1.3.0 (GTK), 1.4.0 (macOS).
 @"notify-on-command-finish-after": Duration = .{ .duration = 5 * std.time.ns_per_s },
+
+/// When enabled, Ghostty will automatically focus the most recent surface that
+/// needs attention (bell/notifications), but only after you have been idle for
+/// `auto-focus-attention-idle`.
+///
+/// This only switches within the current window tab group, and is suppressed
+/// when Ghostty is not the frontmost application.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"auto-focus-attention": bool = false,
+
+/// The user idle threshold for `auto-focus-attention`.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"auto-focus-attention-idle": Duration = .{ .duration = 5 * std.time.ns_per_s },
+
+/// If true (default), Ghostty clears the "needs attention" state as soon as a
+/// surface gains focus (e.g. after `goto_attention` or auto-focus-attention).
+///
+/// If false, the attention highlight will remain until the user interacts with
+/// the surface (keyboard or mouse). This can make it easier to visually
+/// confirm that a focus change occurred before you start typing.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"attention-clear-on-focus": bool = true,
+
+/// Trigger an attention mark when an unfocused surface produces output and then
+/// becomes quiet for the configured duration.
+///
+/// This is useful for TUIs that do not emit BEL (`0x07`) or shell integration
+/// sequences (OSC 133) when they finish work. For example: when a background
+/// pane is streaming output and then stops, the quiet period can be treated as
+/// "work finished" and used to mark attention.
+///
+/// When unset (the default), Ghostty will not mark attention based on output
+/// idleness.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"attention-on-output-idle": ?Duration = null,
+
+/// If true, log additional details about attention tracking (bell/command-finish/
+/// desktop notifications) and attention focus selection on supported runtimes.
+///
+/// This is intended for debugging and may be noisy.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"attention-debug": bool = false,
 
 /// Extra environment variables to pass to commands launched in a terminal
 /// surface. The format is `env=KEY=VALUE`.
@@ -3566,6 +3618,18 @@ else
 /// If `true` (default), applications running in the terminal can show desktop
 /// notifications using certain escape sequences such as OSC 9 or OSC 777.
 @"desktop-notifications": bool = true,
+
+/// When enabled and `desktop-notifications` is also enabled, any surface that
+/// sends a desktop notification will also be marked as needing attention (same
+/// visual indicators as the bell).
+///
+/// This is useful to enable workflows where you have many tabs/splits and want
+/// to cycle or auto-focus to the next surface that needs your input.
+///
+/// macOS only.
+///
+/// Available since: 1.4.0
+@"attention-on-desktop-notification": bool = false,
 
 /// Modifies the color used for bold text in the terminal.
 ///

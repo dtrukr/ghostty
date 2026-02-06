@@ -459,6 +459,11 @@ extension Ghostty {
             return Unmanaged<SurfaceView>.fromOpaque(surface_ud).takeUnretainedValue()
         }
 
+        static private func surfaceViewIsUnfocused(_ surface: SurfaceView) -> Bool {
+            guard let window = surface.window else { return false }
+            return !window.isKeyWindow || !surface.focused
+        }
+
         // MARK: Actions (macOS)
 
         static func action(_ app: ghostty_app_t, target: ghostty_target_s, action: ghostty_action_s) -> Bool {
@@ -603,6 +608,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_RING_BELL:
                 ringBell(app, target: target)
 
+            case GHOSTTY_ACTION_MARK_ATTENTION:
+                markAttention(app, target: target, v: action.action.mark_attention)
+
             case GHOSTTY_ACTION_READONLY:
                 setReadonly(app, target: target, v: action.action.readonly)
 
@@ -611,6 +619,12 @@ extension Ghostty {
                 
             case GHOSTTY_ACTION_OPEN_URL:
                 return openURL(action.action.open_url)
+
+            case GHOSTTY_ACTION_COMMAND_FINISHED:
+                commandFinished(app, target: target, v: action.action.command_finished)
+
+            case GHOSTTY_ACTION_GOTO_ATTENTION:
+                return gotoAttention(app, target: target, v: action.action.goto_attention)
 
             case GHOSTTY_ACTION_UNDO:
                 return undo(app, target: target)
@@ -1043,13 +1057,87 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
+                if let appState = appState(fromView: surfaceView), appState.config.attentionDebug {
+                    let msg = "attention bell source=bell surface=\(surfaceView.id.uuidString) focused=\(surfaceView.focused) windowKey=\(surfaceView.window?.isKeyWindow ?? false) appActive=\(NSApp.isActive)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
                 NotificationCenter.default.post(
                     name: .ghosttyBellDidRing,
-                    object: surfaceView
+                    object: surfaceView,
+                    userInfo: ["source": "bell"]
                 )
 
             default:
                 assertionFailure()
+            }
+        }
+
+        private static func markAttention(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_mark_attention_s
+        ) {
+            switch (target.tag) {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("mark attention does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+
+                let source: String
+                switch v.source {
+                case GHOSTTY_MARK_ATTENTION_SOURCE_OUTPUT_IDLE:
+                    source = "output_idle"
+                default:
+                    source = "unknown"
+                }
+
+                if let appState = appState(fromView: surfaceView), appState.config.attentionDebug {
+                    let msg = "attention bell source=\(source) surface=\(surfaceView.id.uuidString) focused=\(surfaceView.focused) windowKey=\(surfaceView.window?.isKeyWindow ?? false) appActive=\(NSApp.isActive)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+
+                NotificationCenter.default.post(
+                    name: .ghosttyBellDidRing,
+                    object: surfaceView,
+                    userInfo: ["source": source]
+                )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func gotoAttention(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_goto_attention_e
+        ) -> Bool {
+            switch (target.tag) {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("goto attention does nothing with an app target")
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let dir = Ghostty.AttentionFocusDirection.from(direction: v) else { return false }
+                if let appState = appState(fromView: surfaceView), appState.config.attentionDebug {
+                    let msg = "attention goto action surface=\(surfaceView.id.uuidString) direction=\(String(describing: dir))"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                NotificationCenter.default.post(
+                    name: Ghostty.Notification.ghosttyGotoAttention,
+                    object: surfaceView,
+                    userInfo: [Ghostty.Notification.AttentionDirectionKey: dir]
+                )
+                return true
+
+            default:
+                assertionFailure()
+                return false
             }
         }
 
@@ -1072,6 +1160,100 @@ extension Ghostty {
                         SwiftUI.Notification.Name.ReadonlyKey: v == GHOSTTY_READONLY_ON,
                     ]
                 )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func commandFinished(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_command_finished_s
+        ) {
+            switch (target.tag) {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("command finished does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                guard let appState = appState(fromView: surfaceView) else { return }
+                let debugAttention = appState.config.attentionDebug
+
+                // Respect config gating for command finished notifications.
+                switch appState.config.notifyOnCommandFinish {
+                case .never:
+                    if debugAttention {
+                        let msg = "attention command_finished gated=never surface=\(surfaceView.id.uuidString)"
+                        Ghostty.logger.info("\(msg, privacy: .public)")
+                    }
+                    return
+                case .unfocused:
+                    guard surfaceViewIsUnfocused(surfaceView) else {
+                        if debugAttention {
+                            let msg = "attention command_finished gated=focused surface=\(surfaceView.id.uuidString)"
+                            Ghostty.logger.info("\(msg, privacy: .public)")
+                        }
+                        return
+                    }
+                case .always:
+                    break
+                }
+
+                // Duration threshold is configured in milliseconds; value is nanoseconds.
+                let thresholdNs = UInt64(appState.config.notifyOnCommandFinishAfter) * 1_000_000
+                guard v.duration >= thresholdNs else {
+                    if debugAttention {
+                        let msg = "attention command_finished gated=duration surface=\(surfaceView.id.uuidString) durationNs=\(v.duration) thresholdNs=\(thresholdNs)"
+                        Ghostty.logger.info("\(msg, privacy: .public)")
+                    }
+                    return
+                }
+
+                let action = appState.config.notifyOnCommandFinishAction
+
+                if action.contains(.bell) {
+                    if debugAttention {
+                        let msg = "attention command_finished bell surface=\(surfaceView.id.uuidString) durationNs=\(v.duration) exit=\(v.exit_code)"
+                        Ghostty.logger.info("\(msg, privacy: .public)")
+                    }
+                    NotificationCenter.default.post(
+                        name: .ghosttyBellDidRing,
+                        object: surfaceView,
+                        userInfo: ["source": "command_finished"]
+                    )
+                }
+
+                // Only show OS notifications if desktop notifications are enabled.
+                if action.contains(.notify), appState.config.desktopNotifications {
+                    if debugAttention {
+                        let msg = "attention command_finished notify surface=\(surfaceView.id.uuidString) durationNs=\(v.duration) exit=\(v.exit_code)"
+                        Ghostty.logger.info("\(msg, privacy: .public)")
+                    }
+                    let durationMs = v.duration / 1_000_000
+                    let durationString = "\(durationMs)ms"
+
+                    let title: String
+                    let body: String
+                    if v.exit_code < 0 {
+                        title = "Command Finished"
+                        body = "Command took \(durationString)."
+                    } else if v.exit_code == 0 {
+                        title = "Command Succeeded"
+                        body = "Command took \(durationString)."
+                    } else {
+                        title = "Command Failed"
+                        body = "Command took \(durationString) and exited with code \(v.exit_code)."
+                    }
+
+                    let center = UNUserNotificationCenter.current()
+                    center.getNotificationSettings() { settings in
+                        guard settings.authorizationStatus == .authorized else { return }
+                        surfaceView.showUserNotification(title: title, body: body)
+                    }
+                }
 
             default:
                 assertionFailure()
@@ -1370,6 +1552,26 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 guard let title = String(cString: n.title!, encoding: .utf8) else { return }
                 guard let body = String(cString: n.body!, encoding: .utf8) else { return }
+
+                // Optionally treat desktop notifications as an "attention" mark. This
+                // is opt-in and only triggers when the surface is unfocused.
+                if let appState = appState(fromView: surfaceView),
+                   appState.config.desktopNotifications,
+                   appState.config.attentionOnDesktopNotification,
+                   surfaceViewIsUnfocused(surfaceView) {
+                    if appState.config.attentionDebug {
+                        let msg = "attention desktop_notification mark surface=\(surfaceView.id.uuidString) focused=\(surfaceView.focused)"
+                        Ghostty.logger.info("\(msg, privacy: .public)")
+                    }
+                    NotificationCenter.default.post(
+                        name: .ghosttyBellDidRing,
+                        object: surfaceView,
+                        userInfo: ["source": "desktop_notification"]
+                    )
+                } else if let appState = appState(fromView: surfaceView), appState.config.attentionDebug {
+                    let msg = "attention desktop_notification mark skipped surface=\(surfaceView.id.uuidString) desktopNotifications=\(appState.config.desktopNotifications) attentionOnDesktopNotification=\(appState.config.attentionOnDesktopNotification) unfocused=\(surfaceViewIsUnfocused(surfaceView))"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
 
                 let center = UNUserNotificationCenter.current()
                 center.requestAuthorization(options: [.alert, .sound]) { _, error in

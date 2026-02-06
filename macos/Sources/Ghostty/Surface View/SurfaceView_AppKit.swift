@@ -129,6 +129,10 @@ extension Ghostty {
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
 
+        /// The monotonic time of the most recent bell/attention mark (seconds since boot).
+        /// Used for "most recent" attention selection across tabs/splits.
+        @Published private(set) var bellInstant: TimeInterval? = nil
+
         /// True when the surface is in readonly mode.
         @Published private(set) var readonly: Bool = false
 
@@ -442,8 +446,18 @@ extension Ghostty {
                 // On macOS 13+ we can store our continuous clock...
                 focusInstant = ContinuousClock.now
 
-                // We unset our bell state if we gained focus
-                bell = false
+                // By default we clear attention on focus, but some workflows
+                // prefer to keep the visual "needs attention" highlight until
+                // the user actually interacts with the surface.
+                if derivedConfig.attentionClearOnFocus {
+                    if derivedConfig.attentionDebug, self.bell {
+                        let sid = self.id.uuidString
+                        let msg = "attention clear reason=focus surface=\(sid)"
+                        Ghostty.logger.info("\(msg, privacy: .public)")
+                    }
+                    bell = false
+                    bellInstant = nil
+                }
 
                 // Remove any notifications for this surface once we gain focus.
                 if !notificationIdentifiers.isEmpty {
@@ -740,6 +754,14 @@ extension Ghostty {
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
             // Bell state goes to true
             bell = true
+            bellInstant = ProcessInfo.processInfo.systemUptime
+
+            if derivedConfig.attentionDebug {
+                let source = (notification.userInfo?["source"] as? String) ?? "unknown"
+                let sid = self.id.uuidString
+                let msg = "attention mark source=\(source) surface=\(sid) focused=\(self.focused) windowKey=\(self.window?.isKeyWindow ?? false) appActive=\(NSApp.isActive)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
         }
 
         @objc private func ghosttyDidChangeReadonly(_ notification: SwiftUI.Notification) {
@@ -844,6 +866,15 @@ extension Ghostty {
         }
 
         override func mouseDown(with event: NSEvent) {
+            // Any direct interaction should clear attention if it's active.
+            if derivedConfig.attentionDebug, self.bell {
+                let sid = self.id.uuidString
+                let msg = "attention clear reason=mouseDown surface=\(sid)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            bell = false
+            bellInstant = nil
+
             guard let surface = self.surface else { return }
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
             ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods)
@@ -863,6 +894,14 @@ extension Ghostty {
         }
 
         override func otherMouseDown(with event: NSEvent) {
+            if derivedConfig.attentionDebug, self.bell {
+                let sid = self.id.uuidString
+                let msg = "attention clear reason=otherMouseDown surface=\(sid)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            bell = false
+            bellInstant = nil
+
             guard let surface = self.surface else { return }
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
             let button = Ghostty.Input.MouseButton(fromNSEventButtonNumber: event.buttonNumber)
@@ -878,6 +917,14 @@ extension Ghostty {
 
 
         override func rightMouseDown(with event: NSEvent) {
+            if derivedConfig.attentionDebug, self.bell {
+                let sid = self.id.uuidString
+                let msg = "attention clear reason=rightMouseDown surface=\(sid)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            bell = false
+            bellInstant = nil
+
             guard let surface = self.surface else { return super.rightMouseDown(with: event) }
 
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
@@ -1036,7 +1083,13 @@ extension Ghostty {
             }
 
             // On any keyDown event we unset our bell state
+            if derivedConfig.attentionDebug, self.bell {
+                let sid = self.id.uuidString
+                let msg = "attention clear reason=keyDown surface=\(sid)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
             bell = false
+            bellInstant = nil
 
             // We need to translate the mods (maybe) to handle configs such as option-as-alt
             let translationModsGhostty = Ghostty.eventModifierFlags(
@@ -1689,6 +1742,8 @@ extension Ghostty {
             let windowTitleFontFamily: String?
             let windowAppearance: NSAppearance?
             let scrollbar: Ghostty.Config.Scrollbar
+            let attentionDebug: Bool
+            let attentionClearOnFocus: Bool
 
             init() {
                 self.backgroundColor = Color(NSColor.windowBackgroundColor)
@@ -1698,6 +1753,8 @@ extension Ghostty {
                 self.windowTitleFontFamily = nil
                 self.windowAppearance = nil
                 self.scrollbar = .system
+                self.attentionDebug = false
+                self.attentionClearOnFocus = true
             }
 
             init(_ config: Ghostty.Config) {
@@ -1708,6 +1765,8 @@ extension Ghostty {
                 self.windowTitleFontFamily = config.windowTitleFontFamily
                 self.windowAppearance = .init(ghosttyConfig: config)
                 self.scrollbar = config.scrollbar
+                self.attentionDebug = config.attentionDebug
+                self.attentionClearOnFocus = config.attentionClearOnFocus
             }
         }
 
@@ -2163,6 +2222,18 @@ extension Ghostty.SurfaceView {
         /// We use .textArea because the terminal surface is essentially an editable text area
         /// where users can input commands and view output.
         return .textArea
+    }
+
+    override func accessibilityIdentifier() -> String {
+        // Expose a stable identifier per surface so UI tests and accessibility
+        // tools can disambiguate splits/tabs reliably.
+        return "Ghostty.SurfaceView.\(id.uuidString)"
+    }
+
+    override func accessibilityLabel() -> String? {
+        // Include focus state so UI tests (and users of assistive tech) can
+        // disambiguate which split currently has keyboard focus.
+        return focused ? "Terminal surface (focused)" : "Terminal surface"
     }
 
     override func accessibilityHelp() -> String? {
