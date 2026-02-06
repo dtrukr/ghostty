@@ -1058,6 +1058,20 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             );
         },
 
+        .smart_background_key => |w| {
+            defer w.deinit();
+
+            // Always allocate for null-termination. Empty strings clear the label.
+            const str = try self.alloc.dupeZ(u8, w.slice());
+            defer self.alloc.free(str);
+
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .smart_background_key,
+                .{ .key = str },
+            );
+        },
+
         .close => self.close(),
 
         .child_exited => |v| self.childExited(v),

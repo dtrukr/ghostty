@@ -143,6 +143,15 @@ class SurfaceScrollView: NSView {
                 }
             }
             .store(in: &cancellables)
+        // Also react to dynamic background changes (OSC / smart background)
+        // so scrollbar appearance matches the effective surface background.
+        surfaceView.$backgroundColor
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in
+                    self?.synchronizeAppearance()
+                }
+            }
+            .store(in: &cancellables)
         surfaceView.$pointerStyle
             .receive(on: DispatchQueue.main)
             .sink { [weak self] newStyle in
@@ -186,7 +195,8 @@ class SurfaceScrollView: NSView {
     private func synchronizeAppearance() {
         let scrollbarConfig = surfaceView.derivedConfig.scrollbar
         scrollView.hasVerticalScroller = scrollbarConfig != .never
-        let hasLightBackground = OSColor(surfaceView.derivedConfig.backgroundColor).isLightColor
+        let effectiveBackground = surfaceView.backgroundColor ?? surfaceView.derivedConfig.backgroundColor
+        let hasLightBackground = OSColor(effectiveBackground).isLightColor
         // Make sure the scroller’s appearance matches the surface's background color.
         scrollView.appearance = NSAppearance(named: hasLightBackground ? .aqua : .darkAqua)
         updateTrackingAreas()

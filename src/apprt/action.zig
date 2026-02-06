@@ -204,6 +204,9 @@ pub const Action = union(Key) {
     /// The current working directory has changed for the target terminal.
     pwd: Pwd,
 
+    /// The smart background key label has changed for the target terminal.
+    smart_background_key: SmartBackgroundKey,
+
     /// Set the mouse cursor shape.
     mouse_shape: terminal.MouseShape,
 
@@ -367,6 +370,7 @@ pub const Action = union(Key) {
         set_title,
         prompt_title,
         pwd,
+        smart_background_key,
         mouse_shape,
         mouse_visibility,
         mouse_over_link,
@@ -664,6 +668,30 @@ pub const Pwd = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.pwd });
+    }
+};
+
+pub const SmartBackgroundKey = struct {
+    key: [:0]const u8,
+
+    // Sync with: ghostty_action_smart_background_key_s
+    pub const C = extern struct {
+        key: [*:0]const u8,
+    };
+
+    pub fn cval(self: SmartBackgroundKey) C {
+        return .{
+            .key = self.key.ptr,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.key });
     }
 };
 
