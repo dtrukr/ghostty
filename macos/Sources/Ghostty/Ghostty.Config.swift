@@ -566,6 +566,82 @@ extension Ghostty {
             return .milliseconds(v)
         }
 
+        var desktopNotifications: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "desktop-notifications"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var attentionOnDesktopNotification: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "attention-on-desktop-notification"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var attentionDebug: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "attention-debug"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var attentionClearOnFocus: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "attention-clear-on-focus"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var notifyOnCommandFinish: NotifyOnCommandFinish {
+            guard let config = self.config else { return .never }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "notify-on-command-finish"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return .never }
+            guard let ptr = v else { return .never }
+            let str = String(cString: ptr)
+            return NotifyOnCommandFinish(rawValue: str) ?? .never
+        }
+
+        var notifyOnCommandFinishAction: NotifyOnCommandFinishAction {
+            guard let config = self.config else { return .init() }
+            var v: CUnsignedInt = 0
+            let key = "notify-on-command-finish-action"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return .init() }
+            return .init(rawValue: v)
+        }
+
+        /// Minimum command runtime (in milliseconds) for notify-on-command-finish to trigger.
+        var notifyOnCommandFinishAfter: UInt {
+            guard let config = self.config else { return 5000 }
+            var v: UInt = 0
+            let key = "notify-on-command-finish-after"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var autoFocusAttention: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "auto-focus-attention"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        /// User idle threshold in milliseconds for auto-focus-attention.
+        var autoFocusAttentionIdle: UInt {
+            guard let config = self.config else { return 5000 }
+            var v: UInt = 0
+            let key = "auto-focus-attention-idle"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var autoUpdate: AutoUpdate? {
             guard let config = self.config else { return nil }
             var v: UnsafePointer<Int8>? = nil
@@ -795,6 +871,19 @@ extension Ghostty.Config {
             default: return false;
             }
         }
+    }
+
+    enum NotifyOnCommandFinish: String {
+        case never
+        case unfocused
+        case always
+    }
+
+    struct NotifyOnCommandFinishAction: OptionSet {
+        let rawValue: CUnsignedInt
+
+        static let bell = NotifyOnCommandFinishAction(rawValue: 1 << 0)
+        static let notify = NotifyOnCommandFinishAction(rawValue: 1 << 1)
     }
 
     enum WindowDecoration: String {

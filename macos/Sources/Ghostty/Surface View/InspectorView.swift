@@ -95,6 +95,9 @@ extension Ghostty {
                     .foregroundStyle(key == nil ? .secondary : .primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    // Used by XCUITest to deterministically assert the current key label.
+                    .accessibilityIdentifier("Ghostty.Inspector.SmartBackgroundKey")
+                    .accessibilityLabel(key ?? "—")
 
                 Spacer()
             }

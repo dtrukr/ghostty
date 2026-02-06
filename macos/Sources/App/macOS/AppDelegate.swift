@@ -775,7 +775,10 @@ class AppDelegate: NSObject,
     }
 
     @objc private func ghosttyBellDidRing(_ notification: Notification) {
-        if (ghostty.config.bellFeatures.contains(.system)) {
+        let source = notification.userInfo?["source"] as? String
+        let suppressSystemBeep = source == "desktop_notification" || source == "output_idle"
+
+        if ghostty.config.bellFeatures.contains(.system), !suppressSystemBeep {
             NSSound.beep()
         }
 

@@ -73,6 +73,15 @@ pub const Message = union(enum) {
     /// The surface gained or lost focus.
     focused: bool,
 
+    /// The terminal received output from the PTY.
+    ///
+    /// This is used for features that need to react to PTY output from within
+    /// the IO thread event loop (timers, coalescing) rather than directly in
+    /// the hot-path read thread.
+    output_activity: struct {
+        focused: bool,
+    },
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 
