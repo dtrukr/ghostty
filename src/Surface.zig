@@ -1110,6 +1110,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .mark_attention => |v| {
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .mark_attention,
+                v,
+            ) catch |err| {
+                log.warn("apprt failed to mark attention err={}", .{err});
+            };
+        },
+
         .progress_report => |v| {
             _ = self.rt_app.performAction(
                 .{ .surface = self },
@@ -5662,6 +5672,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     apprt.action.GotoSplit,
                     @tagName(tag),
                 ),
+            },
+        ),
+
+        .goto_attention => |direction| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .goto_attention,
+            switch (direction) {
+                .previous => .previous,
+                .next => .next,
             },
         ),
 

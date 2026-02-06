@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) !void {
         "Run the app under valgrind",
     );
     const test_step = b.step("test", "Run tests");
+    const xctest_step = b.step("xctest", "Run Xcode tests (macOS)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -61,6 +62,12 @@ pub fn build(b: *std.Build) !void {
 
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
+
+    const xcode_only_testing = b.option(
+        []const u8,
+        "xcode-only-testing",
+        "Pass -only-testing to xcodebuild test (e.g. GhosttyUITests/GhosttySmartBackgroundUITests)",
+    );
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);
@@ -173,6 +180,7 @@ pub fn build(b: *std.Build) !void {
                 .i18n = if (i18n) |v| &v else null,
                 .resources = &resources,
             },
+            xcode_only_testing,
         );
         if (config.emit_macos_app) {
             macos_app.install();
@@ -217,13 +225,20 @@ pub fn build(b: *std.Build) !void {
                     .i18n = if (i18n) |v| &v else null,
                     .resources = &resources,
                 },
+                xcode_only_testing,
             );
 
             // Run uses the native macOS app
             run_step.dependOn(&macos_app_native_only.open.step);
 
-            // If we have no test filters, install the tests too
-            if (test_filters.len == 0) {
+            // Allow directly running Xcode tests via `zig build xctest` even
+            // when Zig test filters are set (filters only apply to Zig tests).
+            xctest_step.dependOn(&macos_app_native_only.xctest.step);
+
+            // If we have no test filters, install the tests too. If an Xcode
+            // only-testing selector is present, we also opt into xcode tests so
+            // `zig build test -Dxcode-only-testing=...` does what's expected.
+            if (test_filters.len == 0 or xcode_only_testing != null) {
                 macos_app_native_only.addTestStepDependencies(test_step);
             }
         }

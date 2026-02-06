@@ -199,11 +199,6 @@ extension Ghostty {
                     )
                 }
 
-                // Show bell border if enabled
-                if (ghostty.config.bellFeatures.contains(.border)) {
-                    BellBorderOverlay(bell: surfaceView.bell)
-                }
-
                 // Show a highlight effect when this surface needs attention
                 HighlightOverlay(highlighted: surfaceView.highlighted)
 
@@ -228,6 +223,13 @@ extension Ghostty {
                             .allowsHitTesting(false)
                             .opacity(overlayOpacity)
                     }
+                }
+
+                // Show bell border if enabled. This is intentionally after the
+                // unfocused-split overlay so the bell border remains visible even
+                // when a split is unfocused.
+                if (ghostty.config.bellFeatures.contains(.border)) {
+                    BellBorderOverlay(bell: surfaceView.bell)
                 }
 
                 #if canImport(AppKit)
