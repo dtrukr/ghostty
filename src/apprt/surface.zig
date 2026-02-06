@@ -85,6 +85,10 @@ pub const Message = union(enum) {
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 
+    /// The terminal has reported a change in the smart background key label.
+    /// An empty label indicates the key should be cleared.
+    smart_background_key: WriteReq,
+
     /// The terminal encountered a bell character.
     ring_bell,
 

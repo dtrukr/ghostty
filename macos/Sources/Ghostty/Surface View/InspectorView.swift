@@ -29,9 +29,12 @@ extension Ghostty {
                     SplitView(.vertical, $split, dividerColor: ghostty.config.splitDividerColor, left: {
                         SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
                     }, right: {
-                        InspectorViewRepresentable(surfaceView: surfaceView)
-                            .focused($inspectorFocus)
-                            .focusedValue(\.ghosttySurfaceView, surfaceView)
+                        VStack(spacing: 0) {
+                            InspectorInfoBar(surfaceView: surfaceView)
+                            InspectorViewRepresentable(surfaceView: surfaceView)
+                                .focused($inspectorFocus)
+                                .focusedValue(\.ghosttySurfaceView, surfaceView)
+                        }
                     }, onEqualize: {
                         guard let surface = surfaceView.surface else { return }
                         ghostty.splitEqualize(surface: surface)
@@ -71,6 +74,39 @@ extension Ghostty {
 
             default:
                 return
+            }
+        }
+    }
+
+    struct InspectorInfoBar: View {
+        @ObservedObject var surfaceView: SurfaceView
+
+        var body: some View {
+            let key = surfaceView.smartBackgroundKey
+
+            HStack(spacing: 8) {
+                Label("Smart background", systemImage: "paintpalette")
+                    .labelStyle(.titleAndIcon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                Text(verbatim: key ?? "—")
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(key == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background {
+                Rectangle()
+                    .fill(.regularMaterial)
+                    .overlay {
+                        Rectangle()
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                    }
             }
         }
     }

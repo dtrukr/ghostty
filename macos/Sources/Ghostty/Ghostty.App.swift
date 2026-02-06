@@ -534,6 +534,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_PWD:
                 pwdChanged(app, target: target, v: action.action.pwd)
 
+            case GHOSTTY_ACTION_SMART_BACKGROUND_KEY:
+                smartBackgroundKeyChanged(app, target: target, v: action.action.smart_background_key)
+
             case GHOSTTY_ACTION_OPEN_CONFIG:
                 openConfig()
 
@@ -1568,6 +1571,30 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 guard let pwd = String(cString: v.pwd!, encoding: .utf8) else { return }
                 surfaceView.pwd = pwd
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func smartBackgroundKeyChanged(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_smart_background_key_s) {
+            switch (target.tag) {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("smart background key does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                guard let keyPtr = v.key else {
+                    surfaceView.smartBackgroundKey = nil
+                    return
+                }
+                let key = String(cString: keyPtr)
+                surfaceView.smartBackgroundKey = key.isEmpty ? nil : key
 
             default:
                 assertionFailure()
