@@ -11,6 +11,7 @@ const renderer = @import("../renderer.zig");
 const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const terminfo = @import("../terminfo/main.zig");
+const smart_background = @import("smart_background.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
@@ -56,6 +57,14 @@ pub const StreamHandler = struct {
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
 
+    /// Smart per-pane background tinting configuration.
+    smart_background_enabled: bool = false,
+    smart_background_key: configpkg.SmartBackgroundKey = .project,
+    smart_background_strength: f32 = 0.0,
+    smart_background_min_contrast: f64 = 1.0,
+    smart_base_background: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 },
+    smart_base_foreground: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 },
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -81,6 +90,18 @@ pub const StreamHandler = struct {
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
+
+    /// The last computed smart background key. This is a hash of the
+    /// configured key (pwd/project) and may incorporate the reported host
+    /// when the OSC 7 host is not local (untrusted cwd hint).
+    smart_key_hash: ?u64 = null,
+
+    /// Hash of the last reported smart background label (for UI display).
+    smart_label_hash: ?u64 = null,
+
+    /// True if we've already logged that we're ignoring untrusted OSC 7 hosts
+    /// for the trusted working directory.
+    osc7_untrusted_warned: bool = false,
 
     pub const Stream = terminal.Stream(StreamHandler);
 
@@ -113,6 +134,13 @@ pub const StreamHandler = struct {
         self.default_cursor_style = config.cursor_style;
         self.default_cursor_blink = config.cursor_blink;
 
+        self.smart_background_enabled = config.smart_background;
+        self.smart_background_key = config.smart_background_key;
+        self.smart_background_strength = config.smart_background_strength;
+        self.smart_background_min_contrast = config.minimum_contrast;
+        self.smart_base_background = config.background.toTerminalRGB();
+        self.smart_base_foreground = config.foreground.toTerminalRGB();
+
         // If our cursor is the default, then we update it immediately.
         if (self.default_cursor) self.setCursorStyle(.default) catch |err| {
             log.warn("failed to set default cursor style: {}", .{err});
@@ -120,6 +148,168 @@ pub const StreamHandler = struct {
 
         // The config could have changed any of our colors so update mode 2031
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+    }
+
+    /// Applies the smart background tint based on the terminal's current pwd,
+    /// if available. This is intended to be called once during termio init.
+    pub fn smartBackgroundInit(self: *StreamHandler) void {
+        if (!self.smart_background_enabled) return;
+
+        if (self.terminal.getPwd()) |pwd| {
+            self.smart_key_hash = smart_background.hashKey(
+                self.smart_background_key,
+                null,
+                pwd,
+                true,
+            );
+            const key_path = smart_background.keyPath(
+                self.smart_background_key,
+                pwd,
+                true,
+            );
+            self.smartBackgroundNotifyKey(key_path);
+        }
+
+        self.applySmartBackground();
+    }
+
+    /// Re-applies the smart background tint using the last known cwd key.
+    /// This is intended to be called after config changes update defaults.
+    pub fn smartBackgroundReapply(self: *StreamHandler) void {
+        if (!self.smart_background_enabled) {
+            // Keep the key hash (so a later re-enable is immediate), but reset
+            // the background back to the configured base.
+            self.smartBackgroundNotifyKey(null);
+            self.applySmartBackground();
+            return;
+        }
+
+        // If we don't have a key yet but do have a trusted pwd, use it.
+        if (self.smart_key_hash == null) if (self.terminal.getPwd()) |pwd| {
+            self.smart_key_hash = smart_background.hashKey(
+                self.smart_background_key,
+                null,
+                pwd,
+                true,
+            );
+            const key_path = smart_background.keyPath(
+                self.smart_background_key,
+                pwd,
+                true,
+            );
+            self.smartBackgroundNotifyKey(key_path);
+        };
+
+        self.applySmartBackground();
+    }
+
+    fn smartBackgroundUpdateFromCwd(
+        self: *StreamHandler,
+        host: ?[]const u8,
+        path: []const u8,
+        trusted_local: bool,
+    ) void {
+        if (!self.smart_background_enabled) return;
+
+        const host_for_hash: ?[]const u8 = if (trusted_local) null else host;
+        const key_path = smart_background.keyPath(
+            self.smart_background_key,
+            path,
+            trusted_local,
+        );
+        self.smart_key_hash = smart_background.hashKey(
+            self.smart_background_key,
+            host_for_hash,
+            path,
+            trusted_local,
+        );
+        self.smartBackgroundNotifyKeyLabel(host, key_path, trusted_local);
+
+        self.applySmartBackground();
+    }
+
+    fn smartBackgroundClear(self: *StreamHandler) void {
+        self.smart_key_hash = null;
+        self.smartBackgroundNotifyKey(null);
+        self.applySmartBackground();
+    }
+
+    fn smartBackgroundNotifyKeyLabel(
+        self: *StreamHandler,
+        host: ?[]const u8,
+        key_path: []const u8,
+        trusted_local: bool,
+    ) void {
+        var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+        var stack_alloc = std.heap.stackFallback(256, arena_alloc.allocator());
+        defer arena_alloc.deinit();
+
+        const label = label: {
+            if (!trusted_local) {
+                if (host) |h| {
+                    break :label std.fmt.allocPrint(stack_alloc.get(), "{s}:{s}", .{ h, key_path }) catch key_path;
+                }
+            }
+            break :label key_path;
+        };
+
+        self.smartBackgroundNotifyKey(label);
+    }
+
+    fn smartBackgroundNotifyKey(self: *StreamHandler, label: ?[]const u8) void {
+        const hash: ?u64 = if (label) |v| hashLabel(v) else null;
+        if (self.smart_label_hash == hash) return;
+        self.smart_label_hash = hash;
+
+        const payload = label orelse "";
+        if (apprt.surface.Message.WriteReq.init(self.alloc, payload)) |req| {
+            self.surfaceMessageWriter(.{ .smart_background_key = req });
+        } else |err| {
+            log.warn("error notifying surface of smart background key err={}", .{err});
+        }
+    }
+
+    fn hashLabel(label: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(label);
+        return hasher.final();
+    }
+
+    fn applySmartBackground(self: *StreamHandler) void {
+        const desired_default: terminal.color.RGB = desired_default: {
+            if (!self.smart_background_enabled) break :desired_default self.smart_base_background;
+            const key_hash = self.smart_key_hash orelse break :desired_default self.smart_base_background;
+            break :desired_default smart_background.tintedBackground(
+                key_hash,
+                self.smart_base_background,
+                self.smart_base_foreground,
+                self.smart_background_strength,
+                self.smart_background_min_contrast,
+            );
+        };
+
+        const old_effective = self.terminal.colors.background.get();
+
+        self.terminal.colors.background.default = desired_default;
+
+        const new_effective = self.terminal.colors.background.get();
+        if (rgbOptEql(old_effective, new_effective)) return;
+
+        // Notify the surface/UI, similar to OSC-driven color changes.
+        if (new_effective) |rgb| self.surfaceMessageWriter(.{ .color_change = .{
+            .target = .{ .dynamic = .background },
+            .color = rgb,
+        } });
+
+        self.queueRender() catch |err| {
+            log.warn("failed to queue render for smart background err={}", .{err});
+        };
+    }
+
+    fn rgbOptEql(a: ?terminal.color.RGB, b: ?terminal.color.RGB) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.meta.eql(a.?, b.?);
     }
 
     inline fn surfaceMessageWriter(
@@ -1122,6 +1312,10 @@ pub const StreamHandler = struct {
 
             // Report the change.
             self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
+
+            // Clear any smart background key and reset back to the configured
+            // base background (if smart background is enabled).
+            self.smartBackgroundClear();
             return;
         }
 
@@ -1149,11 +1343,8 @@ pub const StreamHandler = struct {
         }
 
         var host_buffer: [std.Uri.host_name_max]u8 = undefined;
-        const host = uri.getHost(&host_buffer) catch |err| switch (err) {
-            error.UriMissingHost => {
-                log.warn("OSC 7 uri must contain a hostname: {}", .{err});
-                return;
-            },
+        const host_opt: ?[]const u8 = uri.getHost(&host_buffer) catch |err| switch (err) {
+            error.UriMissingHost => null,
             error.UriHostTooLong => {
                 log.warn("failed to get full hostname for OSC 7 validation: {}", .{err});
                 return;
@@ -1163,16 +1354,30 @@ pub const StreamHandler = struct {
         // OSC 7 is a little sketchy because anyone can send any value from
         // any host (such an SSH session). The best practice terminals follow
         // is to valid the hostname to be local.
-        const host_valid = internal_os.hostname.isLocal(host) catch |err| switch (err) {
-            error.PermissionDenied,
-            error.Unexpected,
-            => {
-                log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
-                return;
-            },
+        const host_valid = host_valid: {
+            const host = host_opt orelse break :host_valid false;
+            break :host_valid internal_os.hostname.isLocal(host) catch |err| switch (err) {
+                error.PermissionDenied,
+                error.Unexpected,
+                => {
+                    log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
+                    break :host_valid false;
+                },
+            };
         };
-        if (!host_valid) {
-            log.warn("OSC 7 host ({s}) must be local", .{host});
+
+        // If we aren't going to trust this cwd for core behaviors and smart
+        // background tinting isn't enabled, we can return early and avoid the
+        // URI path decoding work below.
+        if (!host_valid and !self.smart_background_enabled) {
+            if (!self.osc7_untrusted_warned) {
+                if (host_opt) |host| {
+                    log.info("OSC 7 host ({s}) is not local; ignoring for trusted pwd", .{host});
+                } else {
+                    log.info("OSC 7 uri missing host; ignoring for trusted pwd", .{});
+                }
+                self.osc7_untrusted_warned = true;
+            }
             return;
         }
 
@@ -1184,6 +1389,25 @@ pub const StreamHandler = struct {
         const path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
 
         log.debug("terminal pwd: {s}", .{path});
+
+        // Update our smart background tinting. We do this regardless of host
+        // validity so that SSH/tmux sessions can still provide useful visual
+        // context without trusting the path for filesystem actions.
+        self.smartBackgroundUpdateFromCwd(host_opt, path, host_valid);
+
+        // Only update the "trusted" pwd when the host is local.
+        if (!host_valid) {
+            if (!self.osc7_untrusted_warned) {
+                if (host_opt) |host| {
+                    log.info("OSC 7 host ({s}) is not local; ignoring for trusted pwd", .{host});
+                } else {
+                    log.info("OSC 7 uri missing host; ignoring for trusted pwd", .{});
+                }
+                self.osc7_untrusted_warned = true;
+            }
+            return;
+        }
+
         try self.terminal.setPwd(path);
 
         // Report it to the surface. If creating our write request fails

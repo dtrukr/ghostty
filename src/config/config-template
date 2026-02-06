@@ -50,3 +50,17 @@
 # # which is explained in the docs for that config option.
 # # Just for example:
 # resize-overlay-duration = 4s 200ms
+
+# Smart background tinting (optional)
+# ==========================
+# # Enable dynamic background tinting based on working directory.
+# smart-background = true
+#
+# # Choose how the tint is keyed: "project" (nearest VCS root) or "pwd" (full path).
+# smart-background-key = project
+#
+# # Strength from 0.0 (off) to 1.0 (strong). Default is 0.22.
+# smart-background-strength = 0.22
+#
+# # Note: if an application overrides the background color (e.g. OSC 11),
+# # Ghostty will preserve the app override and skip smart tinting.

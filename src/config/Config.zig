@@ -576,6 +576,47 @@ background: Color = .{ .r = 0x28, .g = 0x2C, .b = 0x34 },
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
 
+/// Enables automatic per-pane background tinting based on the terminal's
+/// reported working directory (OSC 7 / `PWD` tracking).
+///
+/// This is useful when you use many tabs/splits and want a stronger visual cue
+/// about which pane is "where". The tint color is deterministic, so the same
+/// directory will always map to the same tint color across panes.
+///
+/// If a program running in the terminal sets the background color dynamically
+/// (e.g. via OSC 11), Ghostty will not override it.
+///
+/// Default: `false`
+///
+/// Available since: 1.4.0
+@"smart-background": bool = false,
+
+/// Controls what part of the working directory is used to determine the tint
+/// color.
+///
+/// Valid values are:
+///
+///   * `pwd` - Use the full reported working directory.
+///   * `project` - Use the closest parent directory containing a VCS marker
+///     (such as `.git`, `.hg`, or `.svn`) when the path is local, otherwise
+///     fall back to `pwd`.
+///
+/// Default: `project`
+///
+/// Available since: 1.4.0
+@"smart-background-key": SmartBackgroundKey = .project,
+
+/// The tint strength applied to the background color. A value of 0 disables
+/// tinting (equivalent to `smart-background = false`), and a value of 1 fully
+/// replaces the configured background color with the directory-derived color.
+///
+/// Values outside the range [0, 1] will be clamped.
+///
+/// Default: `0.22`
+///
+/// Available since: 1.4.0
+@"smart-background-strength": f64 = 0.22,
+
 /// Background image for the terminal.
 ///
 /// This should be a path to a PNG or JPEG file, other image formats are
@@ -4501,6 +4542,9 @@ pub fn finalize(self: *Config) !void {
     // Clamp our contrast
     self.@"minimum-contrast" = @min(21, @max(1, self.@"minimum-contrast"));
 
+    // Clamp our smart background tint strength
+    self.@"smart-background-strength" = std.math.clamp(self.@"smart-background-strength", 0.0, 1.0);
+
     // Minimum window size
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
@@ -5083,6 +5127,11 @@ pub const WindowPaddingColor = enum {
     background,
     extend,
     @"extend-always",
+};
+
+pub const SmartBackgroundKey = enum {
+    pwd,
+    project,
 };
 
 pub const WindowSubtitle = enum {
