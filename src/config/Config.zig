@@ -1275,6 +1275,24 @@ command: ?Command = null,
 /// Available since 1.4.0.
 @"auto-focus-attention-resume-delay": Duration = .{ .duration = 0 },
 
+/// If true, and `auto-focus-attention` is pending due to an attention mark that
+/// arrived while you were focused in a surface, switching focus to a different
+/// surface will resume auto-focus-attention (optionally delayed by
+/// `auto-focus-attention-resume-delay`).
+///
+/// This can make auto-focus-attention feel less "stuck" when you use
+/// split/tabs heavily: you can switch to another pane to signal "I'm done
+/// reading here" and allow Ghostty to take you to the attention target.
+///
+/// Note: when combined with `focus-follows-mouse`, simply moving the cursor
+/// across panes may switch focus and trigger resumes. If that feels noisy,
+/// keep this disabled or disable `focus-follows-mouse`.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"auto-focus-attention-resume-on-surface-switch": bool = false,
+
 /// If true (default), Ghostty clears the "needs attention" state as soon as a
 /// surface gains focus (e.g. after `goto_attention` or auto-focus-attention).
 ///

@@ -651,6 +651,16 @@ extension Ghostty {
             return v
         }
 
+        /// If true, switching focus to a different surface will resume a pending
+        /// auto-focus-attention action (subject to auto-focus-attention-resume-delay).
+        var autoFocusAttentionResumeOnSurfaceSwitch: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "auto-focus-attention-resume-on-surface-switch"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var autoUpdate: AutoUpdate? {
             guard let config = self.config else { return nil }
             var v: UnsafePointer<Int8>? = nil
