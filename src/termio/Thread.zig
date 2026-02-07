@@ -413,7 +413,7 @@ fn drainMailbox(
                 self.output_idle_last_output = std.time.Instant.now() catch null;
 
                 // Reset to fire after the configured quiet period.
-                const ms: u64 = @max(1, dur.duration / std.time.ns_per_ms);
+                const ms: u64 = @max(1, (dur.duration + (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
                 if (io.config.attention_debug) {
                     log.info("output-idle arm quiet_ms={}", .{ms});
                 }
@@ -479,11 +479,12 @@ fn outputIdleCallback(
     const last = self.output_idle_last_output orelse return .disarm;
 
     const now = std.time.Instant.now() catch return .disarm;
-    if (now.since(last) < dur.duration) {
+    const elapsed_ns = now.since(last);
+    if (elapsed_ns < dur.duration) {
         // Shouldn't happen often (reset should align), but if we fired early
         // due to scheduling jitter, re-arm for the remainder.
-        const remaining_ns = dur.duration - now.since(last);
-        const ms: u64 = @max(1, remaining_ns / std.time.ns_per_ms);
+        const remaining_ns = dur.duration - elapsed_ns;
+        const ms: u64 = @max(1, (remaining_ns + (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
         if (io.config.attention_debug) {
             log.info("output-idle fired early remaining_ms={}", .{ms});
         }
