@@ -84,12 +84,26 @@ pub fn tintedBackground(
     const strength = std.math.clamp(strength_, 0.0, 1.0);
     if (strength <= 0) return base_bg;
 
-    const hue = @as(f32, @floatFromInt(key_hash % 360)) / 360.0;
     const base_l = @as(f32, @floatCast(base_bg.perceivedLuminance()));
-    // Keep the tint in a "pastel" range: lower saturation, and a slightly
-    // higher lightness floor so the tint reads as a gentle shift.
-    const target_l = std.math.clamp(base_l, 0.30, 0.85);
-    const hue_rgb = hslToRgb(hue, 0.35, target_l);
+    // Keep the tint in a "pastel" range: low saturation and moderate lightness.
+    //
+    // Use multiple independent slices of the hash to avoid collisions where
+    // different keys can map to the same resulting color (for example, a host
+    // change that happens to collide in `hue % 360`).
+    const hue = @as(f32, @floatFromInt(key_hash % 360)) / 360.0;
+    const sat_u8: u8 = @truncate(key_hash >> 16);
+    const l_u8: u8 = @truncate(key_hash >> 24);
+
+    // Saturation 0.18 .. 0.30 (gentle range).
+    const sat = 0.18 + (@as(f32, @floatFromInt(sat_u8)) / 255.0) * 0.12;
+
+    // Target lightness: follow theme brightness but introduce a small, stable
+    // per-key jitter so keys differing only by host still get distinct tints.
+    const base_target_l = std.math.clamp(base_l, 0.30, 0.85);
+    const jitter = (@as(f32, @floatFromInt(l_u8)) / 255.0 - 0.5) * 0.10; // -0.05 .. +0.05
+    const target_l = std.math.clamp(base_target_l + jitter, 0.28, 0.88);
+
+    const hue_rgb = hslToRgb(hue, sat, target_l);
 
     // Clamp strength down if contrast with the configured foreground would
     // become too low. This is best-effort and only applies to the computed
@@ -314,6 +328,40 @@ test "smart_background: hashKey is deterministic" {
     const h1 = hashKey(.pwd, null, "/tmp/foo", true);
     const h2 = hashKey(.pwd, null, "/tmp/foo", true);
     try testing.expectEqual(h1, h2);
+}
+
+test "smart_background: host affects tintedBackground even when path is same" {
+    const testing = std.testing;
+
+    const base_bg: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const base_fg: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    const key_path = "/tmp";
+
+    const h_local = hashKeyFromKeyPath(null, key_path);
+    const h_remote = hashKeyFromKeyPath("203.0.113.1", key_path);
+    try testing.expect(h_local != h_remote);
+
+    const c_local = tintedBackground(h_local, base_bg, base_fg, 1.0, 1.0);
+    const c_remote = tintedBackground(h_remote, base_bg, base_fg, 1.0, 1.0);
+
+    // If these ever collide, smart-background cannot visually differentiate
+    // host changes (for example, a local pane vs SSH/tmux in the same folder).
+    try testing.expect(!std.meta.eql(c_local, c_remote));
+}
+
+test "smart_background: synthetic ssh path affects tintedBackground" {
+    const testing = std.testing;
+
+    const base_bg: terminal.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const base_fg: terminal.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+
+    const a = hashKeyFromKeyPath(null, "/tmp");
+    const b = hashKeyFromKeyPath(null, "/ssh/203.0.113.1/tmp");
+    try testing.expect(a != b);
+
+    const ca = tintedBackground(a, base_bg, base_fg, 1.0, 1.0);
+    const cb = tintedBackground(b, base_bg, base_fg, 1.0, 1.0);
+    try testing.expect(!std.meta.eql(ca, cb));
 }
 
 test "smart_background: project key uses VCS root when available" {

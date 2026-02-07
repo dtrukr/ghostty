@@ -32,6 +32,10 @@ final class GhosttySmartBackgroundUITests: GhosttyCustomConfigCase {
             smart-background = true
             smart-background-key = pwd
             smart-background-strength = 1.0
+
+            # Enable the shell ssh wrapper so this suite can validate SSH-driven
+            # smart-background behavior.
+            shell-integration-features = ssh-env
             """
         )
     }
@@ -66,9 +70,10 @@ final class GhosttySmartBackgroundUITests: GhosttyCustomConfigCase {
     }
 
     private func osc7(host: String, path: String) -> String {
-        // OSC 7: ESC ] 7 ; file://<host><path> BEL
-        // Use hex escapes so the shell doesn't interpret backslashes.
-        #"printf '\x1b]7;file://\#(host)\#(path)\x07'"#
+        // OSC 7: ESC ] 7 ; kitty-shell-cwd://<host><path> BEL
+        // (This matches Ghostty's shell integration, and avoids differences
+        // across platforms/implementations in how file:// authorities are parsed.)
+        #"printf '\x1b]7;kitty-shell-cwd://\#(host)\#(path)\x07'"#
     }
 
     private func osc7(path: String) -> String {
@@ -80,7 +85,7 @@ final class GhosttySmartBackgroundUITests: GhosttyCustomConfigCase {
         // When inside tmux, some OSC sequences can be filtered. Wrap OSC 7 in a
         // tmux passthrough DCS so it reliably reaches the outer terminal:
         //   DCS tmux ; ESC <payload with doubled ESC> ST
-        #"printf '\x1bPtmux;\x1b\x1b]7;file://\#(host)\#(path)\x07\x1b\\'"#
+        #"printf '\x1bPtmux;\x1b\x1b]7;kitty-shell-cwd://\#(host)\#(path)\x07\x1b\\'"#
     }
 
     private func osc7TmuxPassthrough(path: String) -> String {
@@ -307,6 +312,76 @@ final class GhosttySmartBackgroundUITests: GhosttyCustomConfigCase {
         try await Task.sleep(for: .milliseconds(500))
         app.typeText("tmux -L ghostty_ui_test kill-server\n")
         try await Task.sleep(for: .milliseconds(300))
+    }
+
+    @MainActor
+    func testSmartBackgroundDiffersWhenSSHStartsInSameFolder() async throws {
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+
+        // Create a second split (two panes).
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(500))
+
+        func clickPane(normalizedX: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: normalizedX, dy: 0.75)).click()
+        }
+
+        // Put both panes in the same folder so the initial tint matches.
+        clickPane(normalizedX: 0.25)
+        app.typeText("cd /tmp\n")
+        app.typeText("\(osc7(path: "/tmp"))\n")
+        app.typeText("\(clearScreen())\n")
+        try await Task.sleep(for: .milliseconds(300))
+
+        clickPane(normalizedX: 0.75)
+        app.typeText("cd /tmp\n")
+        app.typeText("\(osc7(path: "/tmp"))\n")
+        app.typeText("\(clearScreen())\n")
+        try await Task.sleep(for: .milliseconds(700))
+
+        // Baseline: right pane tint should be stable across short delays.
+        var shot = window.screenshot()
+        let rightBefore1 = rgbAtNormalizedPoint(shot.image, x: 0.75, y: 0.5)
+        try await Task.sleep(for: .milliseconds(300))
+        shot = window.screenshot()
+        let rightBefore2 = rgbAtNormalizedPoint(shot.image, x: 0.75, y: 0.5)
+
+        var dist = colorDistance((rightBefore1.r, rightBefore1.g, rightBefore1.b), (rightBefore2.r, rightBefore2.g, rightBefore2.b))
+        XCTAssertLessThan(
+            dist,
+            6.0,
+            "Expected right pane tint to be stable before invoking ssh. before1=\(rightBefore1) before2=\(rightBefore2) dist=\(dist)"
+        )
+
+        clickPane(normalizedX: 0.75)
+        let host = uiTestSSHHost()
+        let sshBase = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \(host)"
+        let sshOK = try await runLocalCommandAndCaptureExitCode(app, cmd: "\(sshBase) 'true'")
+        guard sshOK == 0 else {
+            throw XCTSkip("SSH preflight failed (need key-based auth): exit=\(sshOK)")
+        }
+
+        // Start an interactive SSH session. The shell integration ssh wrapper
+        // should proactively emit a distinct OSC 7 so smart-background changes
+        // even though we started from the same local folder string.
+        app.typeText("ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \(host)")
+        app.typeKey("\n", modifierFlags: [])
+        try await Task.sleep(for: .seconds(2))
+
+        shot = window.screenshot()
+        let rightAfter = rgbAtNormalizedPoint(shot.image, x: 0.75, y: 0.5)
+
+        let deltaRight = colorDistance((rightBefore2.r, rightBefore2.g, rightBefore2.b), (rightAfter.r, rightAfter.g, rightAfter.b))
+        XCTAssertGreaterThan(
+            deltaRight,
+            10.0,
+            "Expected right pane tint to change when host differs even if path is the same. before=\(rightBefore2) after=\(rightAfter) dist=\(deltaRight)"
+        )
     }
 
     @MainActor

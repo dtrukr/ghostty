@@ -1260,6 +1260,19 @@ command: ?Command = null,
 /// Available since 1.4.0.
 @"auto-focus-attention-idle": Duration = .{ .duration = 5 * std.time.ns_per_s },
 
+/// Minimum age of an attention mark before Ghostty will auto-focus to it.
+///
+/// This is useful to prevent "spam" when a background task completes very
+/// quickly (for example, an agent responding within 1-2 seconds while you're
+/// intentionally working in another tab). With a non-zero value, Ghostty will
+/// only auto-focus to attention marks that have remained pending for at least
+/// this duration.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"auto-focus-attention-min-age": Duration = .{ .duration = 0 },
+
 /// The delay (after leaving the focused surface) before Ghostty will perform an
 /// `auto-focus-attention` action.
 ///

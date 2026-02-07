@@ -86,6 +86,18 @@ if [[ "$GHOSTTY_SHELL_FEATURES" == *"path"* && -n "$GHOSTTY_BIN_DIR" ]]; then
   fi
 fi
 
+function __ghostty_print_osc7_url() {
+  builtin local url="$1"
+  # When running inside tmux, OSC sequences may be filtered. Wrap OSC 7 in a
+  # tmux passthrough DCS so the outer terminal still receives cwd updates when
+  # passthrough is enabled (`allow-passthrough`).
+  if [[ -n "$TMUX" ]]; then
+    builtin printf "\033Ptmux;\033\033]7;%s\007\033\\" "$url"
+  else
+    builtin printf "\e]7;%s\a" "$url"
+  fi
+}
+
 # Sudo
 if [[ "$GHOSTTY_SHELL_FEATURES" == *"sudo"* && -n "$TERMINFO" ]]; then
   # Wrap `sudo` command to ensure Ghostty terminfo is preserved.
@@ -121,6 +133,25 @@ if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
     ssh_term="xterm-256color"
     ssh_opts=()
 
+    # If we can determine the remote hostname, proactively emit an OSC 7 that
+    # changes the smart-background key before entering SSH.
+    #
+    # We intentionally encode the remote host into the *path* portion (and omit
+    # the URI authority host) to ensure the tint changes even if the OSC 7 host
+    # field is missing/ignored by intermediate layers (for example, when later
+    # entering tmux without remote shell integration).
+    builtin local ssh_user ssh_hostname
+    while IFS=' ' read -r ssh_key ssh_value; do
+      case "$ssh_key" in
+      user) ssh_user="$ssh_value" ;;
+      hostname) ssh_hostname="$ssh_value" ;;
+      esac
+      [[ -n "$ssh_user" && -n "$ssh_hostname" ]] && break
+    done < <(builtin command ssh -G "$@" 2>/dev/null)
+    if [[ -n "$ssh_hostname" ]]; then
+      __ghostty_print_osc7_url "kitty-shell-cwd:///ssh/${ssh_hostname}${PWD}"
+    fi
+
     # Configure environment variables for remote session
     if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-env* ]]; then
       ssh_opts+=(-o "SetEnv COLORTERM=truecolor")
@@ -129,16 +160,6 @@ if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-* ]]; then
 
     # Install terminfo on remote host if needed
     if [[ "$GHOSTTY_SHELL_FEATURES" == *ssh-terminfo* ]]; then
-      builtin local ssh_user ssh_hostname
-
-      while IFS=' ' read -r ssh_key ssh_value; do
-        case "$ssh_key" in
-        user) ssh_user="$ssh_value" ;;
-        hostname) ssh_hostname="$ssh_value" ;;
-        esac
-        [[ -n "$ssh_user" && -n "$ssh_hostname" ]] && break
-      done < <(builtin command ssh -G "$@" 2>/dev/null)
-
       if [[ -n "$ssh_hostname" ]]; then
         builtin local ssh_target="${ssh_user}@${ssh_hostname}"
 
@@ -236,7 +257,7 @@ function __ghostty_precmd() {
   # command like cd /test && cat. PS0 is evaluated before cd is run.
   if [[ "$_ghostty_last_reported_cwd" != "$PWD" ]]; then
     _ghostty_last_reported_cwd="$PWD"
-    builtin printf "\e]7;kitty-shell-cwd://%s%s\a" "$HOSTNAME" "$PWD"
+    __ghostty_print_osc7_url "kitty-shell-cwd://${HOSTNAME}${PWD}"
   fi
 
   # Fresh line and start of prompt.
