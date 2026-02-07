@@ -531,6 +531,202 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
     }
 
     @MainActor
+    func testAutoFocusAttentionResumesOnSurfaceSwitchWhenEnabled() async throws {
+        // When enabled, switching to a different surface should resume a pending
+        // auto-focus-attention action (even though we're still focused in a pane).
+        //
+        // With the "reading" gate, auto-focus must never steal focus while the
+        // mouse is inside the focused surface. This test verifies we do not
+        // switch away immediately just because focus changed.
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+
+            auto-focus-attention = true
+            auto-focus-attention-idle = 50ms
+            auto-focus-attention-resume-delay = 0ms
+            auto-focus-attention-resume-on-surface-switch = true
+
+            # Keep focus changes deterministic for this test.
+            focus-follows-mouse = false
+
+            attention-debug = true
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        func click(_ x: CGFloat, _ y: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: y)).click()
+        }
+
+        // Make 3 panes: split right, then split down on the left side.
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(500))
+        click(0.25, 0.75) // focus left
+        window.typeKey("D", modifierFlags: [.command, .shift])
+        try await Task.sleep(for: .milliseconds(600))
+
+        // Capture ttys for:
+        // - pane A (top-left) = attention target
+        // - pane B (right) = switch-to surface
+        // - pane C (bottom-left) = reading surface when attention arrives
+        click(0.25, 0.25) // top-left
+        try await cdTmp(app)
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyA = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(ttyA.hasPrefix("/dev/"), "Expected tty path for pane A, got: \(ttyA)")
+
+        click(0.75, 0.75) // right
+        try await cdTmp(app)
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyB = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(ttyB.hasPrefix("/dev/"), "Expected tty path for pane B, got: \(ttyB)")
+
+        click(0.25, 0.75) // bottom-left
+        try await cdTmp(app)
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyC = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(ttyC.hasPrefix("/dev/"), "Expected tty path for pane C, got: \(ttyC)")
+
+        // While we're focused in pane C, ring pane A (unfocused) to create a pending attention mark.
+        app.typeText("printf '\\a' > \(ttyA)\n")
+        try await Task.sleep(for: .milliseconds(400))
+
+        // Confirm we are still in pane C (paused while focused).
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyWhileFocused = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(ttyWhileFocused, ttyC, "Expected to remain in pane C while attention is pending")
+
+        // Switch focus to a different surface (pane B). With resume-on-surface-switch enabled,
+        // auto-focus must still remain paused while we're reading pane B.
+        click(0.75, 0.75)
+        try await Task.sleep(for: .seconds(2))
+
+        // Verify we're still in pane B (auto-focus is paused while reading).
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyStillB = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(ttyStillB, ttyB, "Expected to still be reading pane B while attention is pending")
+    }
+
+    @MainActor
+    func testAutoFocusAttentionResumeDelayIsDebouncedAndPausesWhileReading() async throws {
+        // Behavior:
+        // - Mouse exit arms a resume countdown (auto-focus-attention-resume-delay).
+        // - Any interaction and/or re-entering a pane pauses the countdown entirely.
+        // - Once the mouse leaves again and we remain quiet for the full delay,
+        //   auto-focus should execute.
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+
+            auto-focus-attention = true
+            auto-focus-attention-idle = 50ms
+            auto-focus-attention-resume-delay = 1500ms
+
+            focus-follows-mouse = false
+            attention-debug = true
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        func click(_ x: CGFloat, _ y: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: y)).click()
+        }
+
+        // Make 3 panes: split right, then split down on the left side.
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(500))
+        click(0.25, 0.75) // focus left
+        window.typeKey("D", modifierFlags: [.command, .shift])
+        try await Task.sleep(for: .milliseconds(600))
+
+        // Capture ttys for:
+        // - pane A (top-left) = attention target
+        // - pane B (right) = "work" pane during countdown
+        // - pane C (bottom-left) = reading surface when attention arrives
+        click(0.25, 0.25) // top-left
+        try await cdTmp(app)
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyA = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        click(0.75, 0.75) // right
+        try await cdTmp(app)
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyB = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        click(0.25, 0.75) // bottom-left
+        try await cdTmp(app)
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyC = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        XCTAssertTrue(ttyA.hasPrefix("/dev/"))
+        XCTAssertTrue(ttyB.hasPrefix("/dev/"))
+        XCTAssertTrue(ttyC.hasPrefix("/dev/"))
+
+        // Ring pane A while we're reading pane C. Auto-focus must remain paused.
+        app.typeText("printf '\\a' > \(ttyA)\n")
+        try await Task.sleep(for: .milliseconds(400))
+
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyWhileReading = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(ttyWhileReading, ttyC)
+
+        // Mouse-exit pane C to arm the resume delay.
+        let dragStartC = window.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.75))
+        let dragEndOutside = window.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: -0.20))
+        dragStartC.press(forDuration: 0.05, thenDragTo: dragEndOutside)
+
+        // Quickly click into pane B to do work. This should pause auto-focus entirely,
+        // even if the originally-armed resume delay elapses.
+        click(0.75, 0.75)
+        try await Task.sleep(for: .seconds(2))
+
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyStillWorking = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(ttyStillWorking, ttyB, "Expected to still be in pane B; auto-focus should be paused while reading/working")
+
+        // Now signal disinterest by moving mouse out of pane B and staying quiet.
+        let dragStartB = window.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.75))
+        dragStartB.press(forDuration: 0.05, thenDragTo: dragEndOutside)
+        try await Task.sleep(for: .seconds(3))
+
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyAfter = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(ttyAfter, ttyA, "Expected auto-focus to eventually focus pane A after mouse exit + quiet period, got \(ttyAfter)")
+    }
+
+    @MainActor
     func testAutoFocusAttentionPausesWhileReadingFocusedPaneAndResumesOnMouseExit() async throws {
         // Behavior:
         // - Auto-focus-attention should not steal focus while a pane is focused (user is reading).

@@ -110,6 +110,10 @@ class BaseTerminalController: NSWindowController,
     /// Set when an attention event occurs but auto-focus-attention is paused.
     private var autoFocusAttentionPending: Bool = false
 
+    /// The surface that was focused when we first entered the paused+pending state.
+    /// Used (optionally) to resume when the user switches to a different surface.
+    private var autoFocusAttentionPausedSurfaceId: UUID? = nil
+
     /// True when the mouse cursor is inside the focused surface. Used as an
     /// explicit "I'm reading/using this pane" signal to pause auto-focus.
     private var autoFocusAttentionMouseInsideFocusedSurface: Bool = true
@@ -889,17 +893,47 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func scheduleAutoFocusAttention() {
-        // Do not steal focus while a surface is actively focused. We'll resume
-        // as soon as focus leaves the surface (optionally delayed).
+        // Do not steal focus while the user is actively "reading" a focused surface.
+        // We interpret "reading" as the mouse being inside the focused surface.
+        //
+        // If the surface is focused but the mouse is outside it, treat that as a
+        // "done reading" signal and arm the resume countdown immediately.
+        if windowFirstResponderSurfaceView() != nil {
+            if shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
+                // Capture the surface that the user was focused on when pending began.
+                if autoFocusAttentionPausedSurfaceId == nil {
+                    autoFocusAttentionPausedSurfaceId = windowFirstResponderSurfaceView()?.id
+                }
+                setAttentionOverlay(autoFocusAttentionPending ? "paused(focused+mouse): pending" : "paused(focused+mouse)")
+                if ghostty.config.attentionDebug {
+                    let msg = "attention autofocusing suppressed reason=surfaceFocused+mouseInside"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                return
+            }
+
+            // Surface is focused but mouse is outside: resume via resume-delay (debounced).
+            resumeAutoFocusAttention(reason: "mouseOutside")
+            return
+        }
+
+        // If the user is actively "reading" a focused surface (mouse inside), pause.
+        // When the mouse leaves the focused surface, `surfaceMouseInsideDidChange`
+        // (and our local event monitor) will call `resumeAutoFocusAttention`.
         if shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
-            setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
+            // Capture the surface that the user was focused on when pending began.
+            if autoFocusAttentionPausedSurfaceId == nil {
+                autoFocusAttentionPausedSurfaceId = windowFirstResponderSurfaceView()?.id
+            }
+            setAttentionOverlay(autoFocusAttentionPending ? "paused(focused+mouse): pending" : "paused(focused+mouse)")
             if ghostty.config.attentionDebug {
-                let msg = "attention autofocusing suppressed reason=surfaceFocused"
+                let msg = "attention autofocusing suppressed reason=surfaceFocused+mouseInside"
                 Ghostty.logger.info("\(msg, privacy: .public)")
             }
             return
         }
 
+        autoFocusAttentionPausedSurfaceId = nil
         autoFocusAttentionWorkItem?.cancel()
 
         autoFocusAttentionToken &+= 1
@@ -924,7 +958,7 @@ class BaseTerminalController: NSWindowController,
         guard window?.isKeyWindow ?? false else { return }
         guard !commandPaletteIsShowing else { return }
         if !bypassFocusPause, shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
-            setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
+            setAttentionOverlay(autoFocusAttentionPending ? "paused(focused+mouse): pending" : "paused(focused+mouse)")
             return
         }
 
@@ -961,6 +995,7 @@ class BaseTerminalController: NSWindowController,
                 Ghostty.logger.info("\(msg, privacy: .public)")
             }
             autoFocusAttentionPending = false
+            autoFocusAttentionPausedSurfaceId = nil
             setAttentionOverlay("noCandidates")
             return
         }
@@ -969,6 +1004,7 @@ class BaseTerminalController: NSWindowController,
             Ghostty.logger.info("\(msg, privacy: .public)")
         }
         autoFocusAttentionPending = false
+        autoFocusAttentionPausedSurfaceId = nil
         setAttentionOverlay("focus \(surface.id.uuidString.prefix(8))")
         controller.focusSurface(surface)
     }
@@ -1103,8 +1139,11 @@ class BaseTerminalController: NSWindowController,
         guard ghostty.config.autoFocusAttention else { return }
         guard autoFocusAttentionPending else { return }
         guard let window, event.window == window else { return }
+        // Prefer the first responder surface, but fall back to our focusedSurface.
+        // During certain UI interactions (dragging/transition animations), the
+        // responder chain can be transiently out of sync, but we still want to
+        // reliably detect mouse exit in UI tests.
         guard let surface = windowFirstResponderSurfaceView() ?? focusedSurface else { return }
-        guard shouldPauseAutoFocusAttentionBecauseSurfaceFocused() else { return }
 
         let locInWindow = event.locationInWindow
         let locInView = surface.convert(locInWindow, from: nil)
@@ -1176,6 +1215,18 @@ class BaseTerminalController: NSWindowController,
             autoFocusAttentionMouseInsideFocusedSurface = true
         }
 
+        // Optional behavior: if we have pending attention and the user switches
+        // to a different surface than the one they were reading when pending began,
+        // treat that as a "done reading" signal and resume auto-focus.
+        if ghostty.config.autoFocusAttentionResumeOnSurfaceSwitch,
+           autoFocusAttentionPending,
+           let pausedId = autoFocusAttentionPausedSurfaceId,
+           let newSurface = windowFirstResponderSurfaceView() ?? to,
+           newSurface.id != pausedId
+        {
+            resumeAutoFocusAttention(reason: "surfaceSwitch")
+        }
+
         // Important to cancel any prior subscriptions
         focusedSurfaceCancellables = []
 
@@ -1207,16 +1258,19 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func shouldPauseAutoFocusAttentionBecauseSurfaceFocused() -> Bool {
-        // Treat any focused terminal surface (first responder) as active user interest
-        // and do not auto-focus away. We intentionally consult the window's current
-        // first responder because `focusedSurface` can be briefly out of sync during
-        // tab/split transitions.
+        // Treat a focused terminal surface as active user interest only while the
+        // mouse is inside that focused surface. This prevents auto-focus from
+        // switching away while the user is reading, but still allows switching
+        // once they move the cursor out of the pane.
+        //
+        // We intentionally consult the window's current first responder because
+        // `focusedSurface` can be briefly out of sync during tab/split transitions.
         guard let window else { return false }
         guard let responderView = window.firstResponder as? NSView else { return false }
 
         var v: NSView? = responderView
         while let cur = v {
-            if cur is Ghostty.SurfaceView { return true }
+            if cur is Ghostty.SurfaceView { return autoFocusAttentionMouseInsideFocusedSurface }
             v = cur.superview
         }
 
@@ -1225,6 +1279,9 @@ class BaseTerminalController: NSWindowController,
 
     private func focusedSurfaceResponderDidChange(focused: Bool) {
         if focused {
+            // Being focused alone doesn't pause auto-focus; mouse-inside does.
+            // However, if we're focused and pending, the most common state is
+            // that the user is reading, so keep the overlay informative.
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
             return
         }
@@ -1240,6 +1297,11 @@ class BaseTerminalController: NSWindowController,
         autoFocusAttentionMouseInsideFocusedSurface = inside
 
         if inside {
+            // If a resume timer is armed, cancel it. The user re-entered the pane,
+            // which is a strong signal that they want to keep reading/working here.
+            autoFocusAttentionWorkItem?.cancel()
+            autoFocusAttentionWorkItem = nil
+            autoFocusAttentionToken &+= 1
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused+mouse): pending" : "paused(focused+mouse)")
         } else {
             resumeAutoFocusAttention(reason: "mouseExit")
@@ -1247,8 +1309,12 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func resumeAutoFocusAttention(reason: String) {
-        // If something is pending, resume immediately (optionally delayed)
-        // without waiting for idle.
+        // If something is pending, resume after a "quiet" period (configurable via
+        // auto-focus-attention-resume-delay) without waiting for idle.
+        //
+        // This resume delay is debounced: any user action during the countdown
+        // resets it. Additionally, if the mouse re-enters the focused surface,
+        // we pause entirely until the mouse leaves again.
         guard ghostty.config.autoFocusAttention else { return }
         guard autoFocusAttentionPending else {
             setAttentionOverlay("idle")
@@ -1257,6 +1323,14 @@ class BaseTerminalController: NSWindowController,
         guard NSApp.isActive else { return }
         guard window?.isKeyWindow ?? false else { return }
         guard !commandPaletteIsShowing else { return }
+
+        // If the user is actively reading (mouse inside focused surface), do not
+        // arm a resume timer. We'll re-enter via mouse exit.
+        if shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
+            setAttentionOverlay(autoFocusAttentionPending ? "paused(focused+mouse): pending" : "paused(focused+mouse)")
+            return
+        }
+
         autoFocusAttentionWorkItem?.cancel()
         autoFocusAttentionWorkItem = nil
         autoFocusAttentionToken &+= 1
@@ -1266,10 +1340,51 @@ class BaseTerminalController: NSWindowController,
         setAttentionOverlay(delayMs == 0 ? "resume now (\(reason))" : "resume in \(delayMs)ms (\(reason))")
 
         let work = DispatchWorkItem { [weak self] in
-            self?.attemptAutoFocusAttention(token: token, bypassIdle: true, bypassFocusPause: true)
+            self?.attemptResumeAutoFocusAttention(token: token, reason: reason, delayMs: delayMs)
         }
         autoFocusAttentionWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(delayMs)), execute: work)
+    }
+
+    private func attemptResumeAutoFocusAttention(token: UInt64, reason: String, delayMs: UInt) {
+        guard ghostty.config.autoFocusAttention else { return }
+        guard autoFocusAttentionPending else {
+            setAttentionOverlay("idle")
+            return
+        }
+        guard NSApp.isActive else { return }
+        guard window?.isKeyWindow ?? false else { return }
+        guard !commandPaletteIsShowing else { return }
+        guard token == autoFocusAttentionToken else { return }
+
+        // If the user is reading/working in a focused surface again, pause entirely.
+        if shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
+            setAttentionOverlay(autoFocusAttentionPending ? "paused(focused+mouse): pending" : "paused(focused+mouse)")
+            return
+        }
+
+        // Debounce: require a full quiet period since the last activity.
+        if delayMs > 0 {
+            let elapsedMs = (ProcessInfo.processInfo.systemUptime - lastUserActivityUptime) * 1000.0
+            if elapsedMs < Double(delayMs) {
+                let remainingMs = UInt(max(0.0, Double(delayMs) - elapsedMs))
+                if ghostty.config.attentionDebug {
+                    let msg = "attention autofocusing resumeWait elapsedMs=\(Int(elapsedMs)) delayMs=\(delayMs) remainingMs=\(remainingMs) reason=\(reason)"
+                    Ghostty.logger.info("\(msg, privacy: .public)")
+                }
+                autoFocusAttentionWorkItem?.cancel()
+                autoFocusAttentionToken &+= 1
+                let newToken = autoFocusAttentionToken
+                let work = DispatchWorkItem { [weak self] in
+                    self?.attemptResumeAutoFocusAttention(token: newToken, reason: reason, delayMs: delayMs)
+                }
+                autoFocusAttentionWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(remainingMs)), execute: work)
+                return
+            }
+        }
+
+        attemptAutoFocusAttention(token: token, bypassIdle: true, bypassFocusPause: true)
     }
 
     private func setAttentionOverlay(_ text: String) {
