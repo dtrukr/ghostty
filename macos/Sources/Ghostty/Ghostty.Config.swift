@@ -590,6 +590,17 @@ extension Ghostty {
             return v
         }
 
+        /// Debounce window in milliseconds for agent status detection based on viewport content.
+        ///
+        /// macOS only.
+        var agentStatusStable: UInt {
+            guard let config = self.config else { return 500 }
+            var v: UInt = 0
+            let key = "agent-status-stable"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var attentionClearOnFocus: Bool {
             guard let config = self.config else { return true }
             var v = true

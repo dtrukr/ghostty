@@ -38,6 +38,9 @@ protocol TerminalViewModel: ObservableObject {
 
     /// Attention engine status overlay (debug UI).
     var attentionOverlayText: String { get }
+
+    /// Agent status overlay (debug UI).
+    var agentStatusOverlayText: String { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -122,9 +125,19 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                 
                 // Show update information above all else.
                 if viewModel.updateOverlayIsVisible {
-                    StatusOverlays(showUpdate: true, attentionText: ghostty.config.attentionDebug ? viewModel.attentionOverlayText : nil)
-                } else if ghostty.config.attentionDebug, !viewModel.attentionOverlayText.isEmpty {
-                    StatusOverlays(showUpdate: false, attentionText: viewModel.attentionOverlayText)
+                    StatusOverlays(
+                        showUpdate: true,
+                        attentionText: ghostty.config.attentionDebug ? viewModel.attentionOverlayText : nil,
+                        agentText: ghostty.config.attentionDebug ? viewModel.agentStatusOverlayText : nil
+                    )
+                } else if ghostty.config.attentionDebug,
+                          (!viewModel.attentionOverlayText.isEmpty || !viewModel.agentStatusOverlayText.isEmpty)
+                {
+                    StatusOverlays(
+                        showUpdate: false,
+                        attentionText: viewModel.attentionOverlayText,
+                        agentText: viewModel.agentStatusOverlayText
+                    )
                 }
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
@@ -135,6 +148,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
 fileprivate struct StatusOverlays: View {
     let showUpdate: Bool
     let attentionText: String?
+    let agentText: String?
 
     var body: some View {
         VStack {
@@ -146,6 +160,10 @@ fileprivate struct StatusOverlays: View {
                 VStack(alignment: .trailing, spacing: 8) {
                     if let attentionText, !attentionText.isEmpty {
                         AttentionPill(text: attentionText)
+                    }
+
+                    if let agentText, !agentText.isEmpty {
+                        AgentStatusPill(text: agentText)
                     }
 
                     if showUpdate, let appDelegate = NSApp.delegate as? AppDelegate {
@@ -183,6 +201,34 @@ fileprivate struct AttentionPill: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("Ghostty.Attention.Overlay")
+        .accessibilityLabel(text)
+    }
+}
+
+fileprivate struct AgentStatusPill: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 11, weight: .semibold))
+            Text(verbatim: text)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.regularMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
+                }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("Ghostty.AgentStatus.Overlay")
         .accessibilityLabel(text)
     }
 }
