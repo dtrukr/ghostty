@@ -1331,6 +1331,16 @@ command: ?Command = null,
 /// Available since 1.4.0.
 @"attention-debug": bool = false,
 
+/// Debounce window for agent status detection based on viewport content.
+///
+/// This is used by debug overlays that summarize whether known agent tools
+/// (Codex, OpenCode, etc.) appear to be running, waiting for input, or idle.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"agent-status-stable": Duration = .{ .duration = 500 * std.time.ns_per_ms },
+
 /// Extra environment variables to pass to commands launched in a terminal
 /// surface. The format is `env=KEY=VALUE`.
 ///

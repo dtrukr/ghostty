@@ -727,6 +727,79 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
     }
 
     @MainActor
+    func testAgentStatusOverlaySummarizesProvidersAcrossSurfaces() async throws {
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            # Agent status overlay is debug-only (tied to attention-debug).
+            attention-debug = true
+            agent-status-stable = 200ms
+
+            focus-follows-mouse = false
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        func click(_ x: CGFloat, _ y: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: y)).click()
+        }
+
+        // Make 3 panes: split right, then split down on the left side.
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(500))
+        click(0.25, 0.75) // focus left
+        window.typeKey("D", modifierFlags: [.command, .shift])
+        try await Task.sleep(for: .milliseconds(600))
+
+        // Set each pane's title to indicate the provider (this is how users typically
+        // see "codex --model ..." in the tab title), then emit viewport text that
+        // matches AoE's heuristics for running/waiting/idle.
+        func setTitleCodex() async throws {
+            app.typeText("printf '\\\\e]0;codex --model gpt\\\\a'\n")
+            try await Task.sleep(for: .milliseconds(150))
+        }
+
+        // Pane A (top-left): Running.
+        click(0.25, 0.25)
+        try await cdTmp(app)
+        try await setTitleCodex()
+        app.typeText("printf 'codex thinking... esc to interrupt\\n'\n")
+
+        // Pane B (right): Waiting.
+        click(0.75, 0.75)
+        try await cdTmp(app)
+        try await setTitleCodex()
+        app.typeText("printf 'codex>\\n'\n")
+
+        // Pane C (bottom-left): Idle.
+        click(0.25, 0.75)
+        try await cdTmp(app)
+        try await setTitleCodex()
+        app.typeText("printf 'codex hello\\n'\n")
+
+        // Allow the polling interval + stable window to elapse.
+        try await Task.sleep(for: .seconds(2))
+
+        let overlay = app.otherElements["Ghostty.AgentStatus.Overlay"]
+        XCTAssertTrue(overlay.waitForExistence(timeout: 2), "Expected agent status overlay to exist when attention-debug=true")
+
+        // Expect the codex provider line to summarize 3 panes: 1 waiting, 1 idle, 1 running.
+        XCTAssertTrue(overlay.label.lowercased().contains("codex"), "Expected overlay to mention codex, got: \(overlay.label)")
+        XCTAssertTrue(overlay.label.contains("⏳1"), "Expected overlay to include waiting count, got: \(overlay.label)")
+        XCTAssertTrue(overlay.label.contains("💤1"), "Expected overlay to include idle count, got: \(overlay.label)")
+        XCTAssertTrue(overlay.label.contains("🏃1"), "Expected overlay to include running count, got: \(overlay.label)")
+    }
+
+    @MainActor
     func testAutoFocusAttentionPausesWhileReadingFocusedPaneAndResumesOnMouseExit() async throws {
         // Behavior:
         // - Auto-focus-attention should not steal focus while a pane is focused (user is reading).

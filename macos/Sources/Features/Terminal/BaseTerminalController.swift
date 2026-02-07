@@ -55,6 +55,9 @@ class BaseTerminalController: NSWindowController,
     /// Debug UI overlay text for the attention/cycling engine.
     @Published var attentionOverlayText: String = ""
 
+    /// Debug UI overlay text for agent status detection (Codex/OpenCode/etc).
+    @Published var agentStatusOverlayText: String = ""
+
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
         self.derivedConfig.focusFollowsMouse
@@ -121,6 +124,26 @@ class BaseTerminalController: NSWindowController,
     /// Last cycled attention surface per tab group, so cycling continues smoothly
     /// when it crosses tabs.
     private static var attentionCycleState: [ObjectIdentifier: UUID] = [:]
+
+    // MARK: Agent Status Detection (Debug)
+
+    private enum AgentProvider: String, CaseIterable {
+        case codex, opencode, claude, vibe, gemini, unknown
+    }
+
+    private enum AgentStatus: String {
+        case running, waiting, idle
+    }
+
+    private struct AgentObservedState {
+        var provider: AgentProvider
+        var status: AgentStatus
+        var sinceUptime: TimeInterval
+    }
+
+    private var agentStatusTimer: Timer? = nil
+    private var agentObserved: [UUID: AgentObservedState] = [:]
+    private var agentStable: [UUID: (provider: AgentProvider, status: AgentStatus)] = [:]
 
     /// The time that undo/redo operations that contain running ptys are valid for.
     var undoExpiration: Duration {
@@ -261,6 +284,9 @@ class BaseTerminalController: NSWindowController,
                 .scrollWheel,
             ]
         ) { [weak self] event in self?.localEventHandler(event) }
+
+        // Agent status overlay is debug-only; keep it inactive unless enabled.
+        syncAgentStatusDetection()
     }
 
     deinit {
@@ -269,6 +295,7 @@ class BaseTerminalController: NSWindowController,
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
         }
+        agentStatusTimer?.invalidate()
     }
 
     // MARK: Methods
@@ -615,6 +642,9 @@ class BaseTerminalController: NSWindowController,
 
         // Update our derived config
         self.derivedConfig = DerivedConfig(config)
+
+        // Start/stop agent status detection overlay based on debug config.
+        syncAgentStatusDetection()
     }
 
     @objc private func ghosttyCommandPaletteDidToggle(_ notification: Notification) {
@@ -1391,6 +1421,457 @@ class BaseTerminalController: NSWindowController,
         guard ghostty.config.attentionDebug else { return }
         if attentionOverlayText == text { return }
         attentionOverlayText = text
+    }
+
+    // MARK: Agent Status Detection
+
+    private func syncAgentStatusDetection() {
+        // Keep this debug-only so we don't introduce background work by default.
+        if ghostty.config.attentionDebug {
+            startAgentStatusDetectionIfNeeded()
+        } else {
+            stopAgentStatusDetection()
+        }
+    }
+
+    private func startAgentStatusDetectionIfNeeded() {
+        guard agentStatusTimer == nil else { return }
+
+        // Keep this conservative: even with cachedVisibleContents, decoding viewport
+        // text can be expensive across many panes.
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollAgentStatuses()
+        }
+        agentStatusTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+
+        // Prime immediately so the overlay appears without waiting a full interval.
+        pollAgentStatuses()
+    }
+
+    private func stopAgentStatusDetection() {
+        agentStatusTimer?.invalidate()
+        agentStatusTimer = nil
+        agentObserved.removeAll()
+        agentStable.removeAll()
+        if !agentStatusOverlayText.isEmpty {
+            agentStatusOverlayText = ""
+        }
+    }
+
+	    private func pollAgentStatuses() {
+	        guard ghostty.config.attentionDebug else { return }
+	        guard let window else { return }
+
+        // Collect all surfaces in the current tab group.
+        let controllers: [BaseTerminalController] = (window.tabGroup?.windows ?? [window])
+            .compactMap { $0.windowController as? BaseTerminalController }
+
+        let allSurfaces: [Ghostty.SurfaceView] = controllers.flatMap { $0.surfaceTree.map { $0 } }
+        if allSurfaces.isEmpty {
+            agentStatusOverlayText = ""
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let stableMs = ghostty.config.agentStatusStable
+        let stableWindow = Double(stableMs) / 1000.0
+
+        var nextStable: [UUID: (provider: AgentProvider, status: AgentStatus)] = agentStable
+        var nextObserved = agentObserved
+
+        // Prune removed surfaces.
+        let ids = Set(allSurfaces.map { $0.id })
+	        nextStable = nextStable.filter { ids.contains($0.key) }
+	        nextObserved = nextObserved.filter { ids.contains($0.key) }
+
+	        // To keep debug overhead bounded in large layouts, only scan a small number of
+	        // "unknown provider" panes per tick. Providers that are already known (from a
+	        // previous scan or from the title) are always updated.
+	        var unknownViewportScanBudget = 3
+
+	        for surface in allSurfaces {
+	            let titleProvider = detectAgentProviderFromTitle(surface.title)
+	            let rememberedProvider = nextStable[surface.id]?.provider ?? nextObserved[surface.id]?.provider ?? .unknown
+	            var provider: AgentProvider = titleProvider != .unknown ? titleProvider : rememberedProvider
+
+	            // Always read viewport for known providers (status changes), and for a small
+	            // rotating set of unknown providers (provider discovery).
+	            let shouldReadViewport: Bool = {
+	                if provider != .unknown { return true }
+	                if unknownViewportScanBudget <= 0 { return false }
+	                unknownViewportScanBudget -= 1
+	                return true
+	            }()
+
+	            var status: AgentStatus = .idle
+	            if shouldReadViewport {
+	                let text = surface.cachedVisibleContents.get()
+	                if provider == .unknown {
+	                    provider = detectAgentProviderFromViewport(text)
+	                }
+	                if provider != .unknown {
+	                    status = detectAgentStatus(provider: provider, viewportText: text)
+	                }
+	            }
+
+	            if var obs = nextObserved[surface.id] {
+	                if obs.provider != provider || obs.status != status {
+	                    // New candidate; reset debounce.
+	                    obs.provider = provider
+	                    obs.status = status
+	                    obs.sinceUptime = now
+	                    nextObserved[surface.id] = obs
+	                } else {
+	                    // Candidate unchanged; promote to stable once it's held long enough.
+	                    if (now - obs.sinceUptime) >= stableWindow {
+	                        nextStable[surface.id] = (provider: provider, status: status)
+	                    }
+	                }
+	            } else {
+	                nextObserved[surface.id] = .init(provider: provider, status: status, sinceUptime: now)
+	                // Don't immediately promote; require stability window.
+	            }
+	        }
+
+        agentObserved = nextObserved
+        agentStable = nextStable
+
+        let overlay = renderAgentStatusOverlay(from: nextStable)
+        if agentStatusOverlayText != overlay {
+            agentStatusOverlayText = overlay
+        }
+    }
+
+    private func renderAgentStatusOverlay(from stable: [UUID: (provider: AgentProvider, status: AgentStatus)]) -> String {
+        guard !stable.isEmpty else { return "" }
+
+        // Counts per provider across the tab group.
+        var counts: [AgentProvider: (waiting: Int, idle: Int, running: Int)] = [:]
+        for (_, v) in stable {
+            var c = counts[v.provider] ?? (waiting: 0, idle: 0, running: 0)
+            switch v.status {
+            case .waiting: c.waiting += 1
+            case .idle: c.idle += 1
+            case .running: c.running += 1
+            }
+            counts[v.provider] = c
+        }
+
+        // Stable ordering (most useful first).
+        let order: [AgentProvider] = [.codex, .opencode, .claude, .vibe, .gemini, .unknown]
+
+        // Emojis to keep it compact:
+        // - waiting: ⏳
+        // - idle: 💤
+        // - running: 🏃
+        let pieces: [String] = order.compactMap { p in
+            guard let c = counts[p] else { return nil }
+            return "\(p.rawValue) ⏳\(c.waiting) 💤\(c.idle) 🏃\(c.running)"
+        }
+
+        return pieces.joined(separator: "  |  ")
+    }
+
+	    private func detectAgentProviderFromTitle(_ title: String) -> AgentProvider {
+	        let t = title.lowercased()
+	        func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }
+
+        // Prefer explicit title matches since they are often set to the running tool command.
+        if hasAny(t, ["codex"]) { return .codex }
+        if hasAny(t, ["opencode", "open code"]) { return .opencode }
+        if hasAny(t, ["claude"]) { return .claude }
+        if hasAny(t, ["vibe"]) { return .vibe }
+        if hasAny(t, ["gemini"]) { return .gemini }
+
+	        return .unknown
+	    }
+
+	    private func detectAgentProviderFromViewport(_ viewportText: String) -> AgentProvider {
+	        let t = viewportText.lowercased()
+	        func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }
+
+	        // Keep this intentionally loose: we only use this when title is unknown and we want
+	        // a best-effort provider classification.
+	        if hasAny(t, ["codex", "openai codex"]) { return .codex }
+	        if hasAny(t, ["opencode", "open code"]) { return .opencode }
+	        if hasAny(t, ["claude"]) { return .claude }
+	        if hasAny(t, ["vibe"]) { return .vibe }
+	        if hasAny(t, ["gemini"]) { return .gemini }
+
+	        return .unknown
+	    }
+
+	    private func detectAgentStatus(provider: AgentProvider, viewportText: String) -> AgentStatus {
+	        // Ported from agent-of-empires status detection (viewport-only).
+	        switch provider {
+        case .claude:
+            return detectClaudeStatus(viewportText)
+        case .opencode:
+            return detectOpenCodeStatus(viewportText)
+        case .vibe:
+            return detectVibeStatus(viewportText)
+        case .codex:
+            return detectCodexStatus(viewportText)
+        case .gemini:
+            return detectGeminiStatus(viewportText)
+        case .unknown:
+            // Default to idle to avoid false "waiting" in generic shells.
+            return .idle
+        }
+    }
+
+    private static let aoeSpinnerChars: [String] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    private func nonEmptyLines(_ content: String) -> [String] {
+        content
+            .split(whereSeparator: \.isNewline)
+            .map { String($0) }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func lastLines(_ lines: [String], count: Int) -> String {
+        let tail = lines.suffix(count)
+        return tail.joined(separator: "\n")
+    }
+
+    private func containsSpinner(_ content: String) -> Bool {
+        for sp in Self.aoeSpinnerChars where content.contains(sp) { return true }
+        return false
+    }
+
+    private func stripAnsiLikeAoe(_ s: String) -> String {
+        // Match AoE's simple strip: remove CSI sequences and OSC ... BEL.
+        var out = s
+        while let r = out.range(of: "\u{1b}[") {
+            let rest = out[r.upperBound...]
+            if let end = rest.firstIndex(where: { $0.isLetter }) {
+                out.removeSubrange(r.lowerBound..<out.index(after: end))
+            } else {
+                break
+            }
+        }
+        while let r = out.range(of: "\u{1b}]") {
+            if let bel = out[r.lowerBound...].firstIndex(of: "\u{7}") {
+                out.removeSubrange(r.lowerBound..<out.index(after: bel))
+            } else {
+                break
+            }
+        }
+        return out
+    }
+
+    private func detectClaudeStatus(_ content: String) -> AgentStatus {
+        let lines = content.split(whereSeparator: \.isNewline).map { String($0) }
+        let nonEmpty = nonEmptyLines(content)
+        let last = lastLines(nonEmpty, count: 30)
+        let lastLower = last.lowercased()
+
+        if lastLower.contains("esc to interrupt") || lastLower.contains("ctrl+c to interrupt") {
+            return .running
+        }
+        if containsSpinner(content) {
+            return .running
+        }
+        if lastLower.contains("enter to select") || lastLower.contains("esc to cancel") {
+            return .waiting
+        }
+        let permissionPrompts = [
+            "Yes, allow once",
+            "Yes, allow always",
+            "Allow once",
+            "Allow always",
+            "❯ Yes",
+            "❯ No",
+            "Do you trust the files in this folder?",
+        ]
+        for p in permissionPrompts where last.contains(p) { return .waiting }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("❯"), trimmed.count > 2 {
+                let rest = trimmed.dropFirst(2).trimmingCharacters(in: .whitespacesAndNewlines)
+                if rest.hasPrefix("1.") || rest.hasPrefix("2.") || rest.hasPrefix("3.") {
+                    return .waiting
+                }
+            }
+        }
+
+        for line in nonEmpty.suffix(10).reversed() {
+            let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean == ">" || clean == "> " { return .waiting }
+            if clean.hasPrefix("> "),
+               !clean.lowercased().contains("esc"),
+               clean.count < 100
+            {
+                return .waiting
+            }
+        }
+
+        let yn = ["(Y/n)", "(y/N)", "[Y/n]", "[y/N]"]
+        for p in yn where last.contains(p) { return .waiting }
+
+        return .idle
+    }
+
+    private func detectOpenCodeStatus(_ content: String) -> AgentStatus {
+        let lines = content.split(whereSeparator: \.isNewline).map { String($0) }
+        let nonEmpty = nonEmptyLines(content)
+        let last = lastLines(nonEmpty, count: 30)
+        let lastLower = last.lowercased()
+
+        if lastLower.contains("esc to interrupt") || lastLower.contains("esc interrupt") {
+            return .running
+        }
+        if containsSpinner(content) {
+            return .running
+        }
+        if lastLower.contains("enter to select") || lastLower.contains("esc to cancel") {
+            return .waiting
+        }
+
+        let permission = ["(y/n)", "[y/n]", "continue?", "proceed?", "approve", "allow"]
+        for p in permission where lastLower.contains(p) { return .waiting }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("❯"), trimmed.count > 2 {
+                let rest = trimmed.dropFirst(2).trimmingCharacters(in: .whitespacesAndNewlines)
+                if rest.hasPrefix("1.") || rest.hasPrefix("2.") || rest.hasPrefix("3.") {
+                    return .waiting
+                }
+            }
+        }
+        if lines.contains(where: { $0.contains("❯") && ($0.contains(" 1.") || $0.contains(" 2.") || $0.contains(" 3.")) }) {
+            return .waiting
+        }
+
+        for line in nonEmpty.suffix(10).reversed() {
+            let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean == ">" || clean == "> " || clean == ">>" { return .waiting }
+            if clean.hasPrefix("> "),
+               !clean.lowercased().contains("esc"),
+               clean.count < 100
+            {
+                return .waiting
+            }
+        }
+
+        let completionIndicators = [
+            "complete",
+            "done",
+            "finished",
+            "ready",
+            "what would you like",
+            "what else",
+            "anything else",
+            "how can i help",
+            "let me know",
+        ]
+        let hasCompletion = completionIndicators.contains(where: { lastLower.contains($0) })
+        if hasCompletion {
+            for line in nonEmpty.suffix(10).reversed() {
+                let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                if clean == ">" || clean == "> " || clean == ">>" {
+                    return .waiting
+                }
+            }
+        }
+
+        return .idle
+    }
+
+    private func detectVibeStatus(_ content: String) -> AgentStatus {
+        let nonEmpty = nonEmptyLines(content)
+        let last = lastLines(nonEmpty, count: 30)
+        let lastLower = last.lowercased()
+
+        let recentText = nonEmpty.suffix(50).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.joined()
+        let recentLower = recentText.lowercased()
+
+        if lastLower.contains("↑↓ navigate") || lastLower.contains("enter select") || lastLower.contains("esc reject") {
+            return .waiting
+        }
+        if last.contains("⚠"), lastLower.contains("command") {
+            return .waiting
+        }
+        let approval = ["yes and always allow", "no and tell the agent", "› 1.", "› 2.", "› 3."]
+        for o in approval where lastLower.contains(o) { return .waiting }
+
+        if content.split(whereSeparator: \.isNewline).contains(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("›") }) {
+            return .waiting
+        }
+
+        if containsSpinner(recentText) { return .running }
+        let activity = ["running", "reading", "writing", "executing", "processing", "generating", "thinking"]
+        for a in activity where recentLower.contains(a) { return .running }
+        if recentText.hasSuffix("…") || recentText.hasSuffix("...") { return .running }
+
+        return .idle
+    }
+
+    private func detectCodexStatus(_ content: String) -> AgentStatus {
+        let lines = content.split(whereSeparator: \.isNewline).map { String($0) }
+        let nonEmpty = nonEmptyLines(content)
+        let last = lastLines(nonEmpty, count: 30)
+        let lastLower = last.lowercased()
+
+        if lastLower.contains("esc to interrupt")
+            || lastLower.contains("ctrl+c to interrupt")
+            || lastLower.contains("working")
+            || lastLower.contains("thinking")
+        {
+            return .running
+        }
+        if containsSpinner(content) { return .running }
+
+        let approval = ["approve", "allow", "(y/n)", "[y/n]", "continue?", "proceed?", "execute?", "run command?"]
+        for p in approval where lastLower.contains(p) { return .waiting }
+        if lastLower.contains("enter to select") || lastLower.contains("esc to cancel") { return .waiting }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("❯"), trimmed.count > 2 {
+                let rest = trimmed.dropFirst(2).trimmingCharacters(in: .whitespacesAndNewlines)
+                if rest.hasPrefix("1.") || rest.hasPrefix("2.") || rest.hasPrefix("3.") {
+                    return .waiting
+                }
+            }
+        }
+
+        for line in nonEmpty.suffix(10).reversed() {
+            let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean == ">" || clean == "> " || clean == "codex>" { return .waiting }
+            if clean.hasPrefix("> "),
+               !clean.lowercased().contains("esc"),
+               clean.count < 100
+            {
+                return .waiting
+            }
+        }
+
+        return .idle
+    }
+
+    private func detectGeminiStatus(_ content: String) -> AgentStatus {
+        let nonEmpty = nonEmptyLines(content)
+        let last = lastLines(nonEmpty, count: 30)
+        let lastLower = last.lowercased()
+
+        if lastLower.contains("esc to interrupt") || lastLower.contains("ctrl+c to interrupt") {
+            return .running
+        }
+        if containsSpinner(content) { return .running }
+
+        let approval = ["(y/n)", "[y/n]", "allow", "approve", "execute?", "enter to select", "esc to cancel"]
+        for p in approval where lastLower.contains(p) { return .waiting }
+
+        for line in nonEmpty.suffix(10).reversed() {
+            let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean == ">" || clean == "> " { return .waiting }
+        }
+
+        return .idle
     }
     
     private func computeTitle(title: String, bell: Bool) -> String {
