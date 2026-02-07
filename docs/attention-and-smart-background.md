@@ -207,8 +207,59 @@ the terminal controller:
 - `macos/Sources/Features/Terminal/BaseTerminalController.swift`
   - `cycleAttention(...)` chooses among surfaces where `surfaceView.bell == true`
   - Most recent is determined by `bellInstant` (monotonic uptime)
-  - Auto-focus listens for `.ghosttyBellDidRing` and, when enabled, schedules a
-    focus attempt after `auto-focus-attention-idle` user-idle threshold
+
+#### Auto-Focus: Exact Focus + Mouse Gating Logic
+
+Auto-focus listens for `.ghosttyBellDidRing`. If `auto-focus-attention = true`,
+it marks the controller as "pending" and then decides when it is allowed to
+steal focus.
+
+Key idea: **auto-focus is paused while you are "reading" the currently focused
+pane**, where "reading" is defined as:
+
+- A terminal surface is focused (first responder is inside a `SurfaceView`)
+- The mouse cursor is inside that focused `SurfaceView`
+
+This prevents focus from being stolen while you're looking at a pane, even if
+you are not typing.
+
+When attention becomes pending:
+
+1. If a surface is focused and the mouse is inside it:
+   - Auto-focus is paused (no timers are armed).
+   - Debug overlay shows `paused(focused+mouse): pending`.
+2. If a surface is focused but the mouse is outside it:
+   - Auto-focus is allowed to resume (it arms the resume countdown described
+     below).
+3. If no surface is focused (terminal isn't first responder):
+   - Auto-focus waits for `auto-focus-attention-idle` of user-idle, then focuses
+     the most recent attention surface.
+
+When auto-focus is allowed to resume, it uses `auto-focus-attention-resume-delay`
+as a **debounced quiet-period**:
+
+- A resume attempt is scheduled for `resume-delay` ms.
+- Any user action (mouse/keyboard/scroll/mouse move) updates the activity
+  timestamp and forces the resume attempt to wait until a full `resume-delay`
+  has elapsed since the last activity.
+- If the mouse re-enters a focused surface while a resume timer is armed, the
+  timer is canceled and auto-focus returns to the paused state.
+
+Optional: `auto-focus-attention-resume-on-surface-switch = true`
+
+- If attention is pending and you switch focus to a different pane, Ghostty
+  treats that as a "done reading the previous pane" signal and queues the
+  resume logic.
+- It still will not steal focus while the mouse is inside the newly focused
+  pane.
+
+Notes:
+
+- With `focus-follows-mouse = true`, many workflows remain in a perpetual
+  `paused(focused+mouse)` state because the cursor is almost always inside some
+  pane. For predictable behavior, prefer `focus-follows-mouse = false`.
+- Auto-focus prioritizes attention candidates within the current tab first, and
+  only falls back to other tabs when the current tab has no candidates.
 
 The attention border itself is rendered by:
 
