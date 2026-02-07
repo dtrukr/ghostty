@@ -144,6 +144,21 @@ test "parse: mac_address" {
     ));
 }
 
+test "parse: file uri with ip host" {
+    const testing = std.testing;
+
+    const uri = try parse("file://203.0.113.1/tmp", .{});
+    try testing.expectEqualStrings("file", uri.scheme);
+    try testing.expectEqualStrings("/tmp", uri.path.percent_encoded);
+
+    var host_buf: [std.Uri.host_name_max]u8 = undefined;
+    const host = uri.getHost(&host_buf) catch |err| switch (err) {
+        error.UriMissingHost => return error.TestExpectedEqual,
+        else => return err,
+    };
+    try testing.expectEqualStrings("203.0.113.1", host);
+}
+
 test "parse: raw_path" {
     const testing = @import("std").testing;
 

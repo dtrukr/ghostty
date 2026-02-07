@@ -80,6 +80,8 @@ output_idle_c: xev.Completion = .{},
 output_idle_cancel_c: xev.Completion = .{},
 output_idle_armed: bool = false,
 output_idle_last_output: ?std.time.Instant = null,
+output_idle_first_output: ?std.time.Instant = null,
+output_idle_output_events: u32 = 0,
 output_idle_last_resize: ?std.time.Instant = null,
 
 flags: packed struct {
@@ -364,6 +366,8 @@ fn drainMailbox(
                     }
                     self.output_idle_armed = false;
                     self.output_idle_last_output = null;
+                    self.output_idle_first_output = null;
+                    self.output_idle_output_events = 0;
                     if (self.output_idle_c.state() == .active and
                         self.output_idle_cancel_c.state() == .dead)
                     {
@@ -409,8 +413,16 @@ fn drainMailbox(
                     }
                 }
 
+                const now_inst = std.time.Instant.now() catch null;
+                const was_armed = self.output_idle_armed;
                 self.output_idle_armed = true;
-                self.output_idle_last_output = std.time.Instant.now() catch null;
+                if (!was_armed) {
+                    self.output_idle_first_output = now_inst;
+                    self.output_idle_output_events = 1;
+                } else {
+                    self.output_idle_output_events +|= 1;
+                }
+                self.output_idle_last_output = now_inst;
 
                 // Reset to fire after the configured quiet period.
                 const ms: u64 = @max(1, (dur.duration + (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
@@ -476,9 +488,27 @@ fn outputIdleCallback(
     if (!self.output_idle_armed) return .disarm;
 
     const dur = io.config.attention_on_output_idle orelse return .disarm;
-    const last = self.output_idle_last_output orelse return .disarm;
+    const last = self.output_idle_last_output orelse {
+        self.output_idle_armed = false;
+        self.output_idle_first_output = null;
+        self.output_idle_output_events = 0;
+        return .disarm;
+    };
+    const first = self.output_idle_first_output orelse {
+        self.output_idle_armed = false;
+        self.output_idle_last_output = null;
+        self.output_idle_output_events = 0;
+        return .disarm;
+    };
+    const events = self.output_idle_output_events;
 
-    const now = std.time.Instant.now() catch return .disarm;
+    const now = std.time.Instant.now() catch {
+        self.output_idle_armed = false;
+        self.output_idle_last_output = null;
+        self.output_idle_first_output = null;
+        self.output_idle_output_events = 0;
+        return .disarm;
+    };
     const elapsed_ns = now.since(last);
     if (elapsed_ns < dur.duration) {
         // Shouldn't happen often (reset should align), but if we fired early
@@ -500,7 +530,31 @@ fn outputIdleCallback(
         return .disarm;
     }
 
+    // Heuristic: ignore "single-burst" output that is likely just a redraw
+    // (e.g. tmux status refresh) rather than meaningful work completion. This
+    // prevents background panes from constantly stealing attention when an app
+    // emits occasional UI updates without doing real work.
+    //
+    // We consider output meaningful if it spans a short time window (streaming)
+    // or arrives in multiple distinct reads.
+    const burst_ns = last.since(first);
+    const min_burst_ns: u64 = 500 * std.time.ns_per_ms;
+    const min_events: u32 = 25;
+    if (events < min_events and burst_ns < min_burst_ns) {
+        if (io.config.attention_debug) {
+            log.info("output-idle disarm reason=short_burst events={} burst_ms={}", .{ events, burst_ns / std.time.ns_per_ms });
+        }
+        self.output_idle_armed = false;
+        self.output_idle_last_output = null;
+        self.output_idle_first_output = null;
+        self.output_idle_output_events = 0;
+        return .disarm;
+    }
+
     self.output_idle_armed = false;
+    self.output_idle_last_output = null;
+    self.output_idle_first_output = null;
+    self.output_idle_output_events = 0;
 
     if (io.config.attention_debug) {
         log.info("output-idle fired ok", .{});

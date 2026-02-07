@@ -124,6 +124,32 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
             set -l ssh_term xterm-256color
             set -l ssh_opts
 
+            # If we can determine the remote hostname, proactively emit an OSC 7
+            # that changes the smart-background key before entering SSH.
+            #
+            # We intentionally encode the remote host into the *path* portion
+            # (and omit the URI authority host) to ensure the tint changes even
+            # if the OSC 7 host field is missing/ignored by intermediate layers.
+            set -l ssh_user
+            set -l ssh_hostname
+            for line in (command ssh -G $argv 2>/dev/null)
+                set -l parts (string split ' ' -- $line)
+                if test (count $parts) -ge 2
+                    switch $parts[1]
+                        case user
+                            set ssh_user $parts[2]
+                        case hostname
+                            set ssh_hostname $parts[2]
+                    end
+                    if test -n "$ssh_user"; and test -n "$ssh_hostname"
+                        break
+                    end
+                end
+            end
+            if test -n "$ssh_hostname"
+                __ghostty_print_osc7_url "kitty-shell-cwd:///ssh/$ssh_hostname$PWD"
+            end
+
             # Configure environment variables for remote session
             if contains ssh-env $features
                 set -a ssh_opts -o "SetEnv COLORTERM=truecolor"
@@ -132,24 +158,6 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
 
             # Install terminfo on remote host if needed
             if contains ssh-terminfo $features
-                set -l ssh_user
-                set -l ssh_hostname
-
-                for line in (command ssh -G $argv 2>/dev/null)
-                    set -l parts (string split ' ' -- $line)
-                    if test (count $parts) -ge 2
-                        switch $parts[1]
-                            case user
-                                set ssh_user $parts[2]
-                            case hostname
-                                set ssh_hostname $parts[2]
-                        end
-                        if test -n "$ssh_user"; and test -n "$ssh_hostname"
-                            break
-                        end
-                    end
-                end
-
                 if test -n "$ssh_hostname"
                     set -l ssh_target "$ssh_user@$ssh_hostname"
 
@@ -220,13 +228,24 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
         echo -en "\e]133;D;$status\a"
     end
 
+    function __ghostty_print_osc7_url -d 'Emit OSC 7, optionally wrapped for tmux passthrough'
+        set -l url $argv[1]
+        if set -q TMUX
+            # tmux may filter OSC sequences; wrap OSC 7 in a tmux passthrough DCS
+            # so the outer terminal receives it when passthrough is enabled.
+            printf "\ePtmux;\e\e]7;%s\a\e\\" $url
+        else
+            printf "\e]7;%s\a" $url
+        end
+    end
+
     # Report pwd. This is actually built-in to fish but only for terminals
     # that match an allowlist and that isn't us.
     function __update_cwd_osc --on-variable PWD -d 'Notify capable terminals when $PWD changes'
         if status --is-command-substitution || set -q INSIDE_EMACS
             return
         end
-        printf \e\]7\;file://%s%s\a $hostname (string escape --style=url $PWD)
+        __ghostty_print_osc7_url "file://$hostname"(string escape --style=url $PWD)
     end
 
     # Enable fish to handle reflow because Ghostty clears the prompt on resize.

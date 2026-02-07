@@ -64,6 +64,14 @@ auto-focus-attention = true
 auto-focus-attention-idle = 5000ms
 ```
 
+Optional: prevent "spam" focus switches for very fast attention marks by
+requiring an attention mark to remain pending for a minimum duration before
+auto-focus can act on it:
+
+```conf
+auto-focus-attention-min-age = 2s
+```
+
 Optional: keep the attention border until user interaction (not merely focus):
 
 ```conf
@@ -218,7 +226,9 @@ Key idea: **auto-focus is paused while you are "reading" the currently focused
 pane**, where "reading" is defined as:
 
 - A terminal surface is focused (first responder is inside a `SurfaceView`)
-- The mouse cursor is inside that focused `SurfaceView`
+- Either:
+  - The mouse cursor is inside that focused `SurfaceView`, or
+  - The focused surface was the most recent auto-focus target ("focus lock")
 
 This prevents focus from being stolen while you're looking at a pane, even if
 you are not typing.
@@ -227,13 +237,22 @@ When attention becomes pending:
 
 1. If a surface is focused and the mouse is inside it:
    - Auto-focus is paused (no timers are armed).
-   - Debug overlay shows `paused(focused+mouse): pending`.
-2. If a surface is focused but the mouse is outside it:
+   - Debug overlay shows `paused(focused): pending`.
+2. If auto-focus previously focused a surface and you are still focused there:
+   - Auto-focus is paused regardless of mouse position ("focus lock").
+   - This prevents bouncing between tabs if new attention arrives elsewhere while you're reading.
+3. If a surface is focused but the mouse is outside it:
    - Auto-focus is allowed to resume (it arms the resume countdown described
      below).
-3. If no surface is focused (terminal isn't first responder):
+4. If no surface is focused (terminal isn't first responder):
    - Auto-focus waits for `auto-focus-attention-idle` of user-idle, then focuses
      the most recent attention surface.
+
+Additionally, auto-focus can enforce a minimum attention age:
+
+- If `auto-focus-attention-min-age` is non-zero, Ghostty will not focus an
+  attention target until the pending attention has been present for at least
+  that duration. This is intended to reduce "tab spam" from very fast jobs.
 
 When auto-focus is allowed to resume, it uses `auto-focus-attention-resume-delay`
 as a **debounced quiet-period**:
@@ -249,9 +268,9 @@ Optional: `auto-focus-attention-resume-on-surface-switch = true`
 
 - If attention is pending and you switch focus to a different pane, Ghostty
   treats that as a "done reading the previous pane" signal and queues the
-  resume logic.
-- It still will not steal focus while the mouse is inside the newly focused
-  pane.
+  resume logic (it bypasses the focus-pause check for this resume).
+- This resume is intentionally allowed even if the mouse is inside the newly
+  focused pane (the explicit focus change is taken as the user's signal).
 
 Notes:
 

@@ -653,6 +653,15 @@ extension Ghostty {
             return v
         }
 
+        /// Minimum attention age in milliseconds before auto-focus-attention will trigger.
+        var autoFocusAttentionMinAge: UInt {
+            guard let config = self.config else { return 0 }
+            var v: UInt = 0
+            let key = "auto-focus-attention-min-age"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         /// Delay in milliseconds (after leaving the focused surface) before auto-focus-attention runs.
         var autoFocusAttentionResumeDelay: UInt {
             guard let config = self.config else { return 0 }

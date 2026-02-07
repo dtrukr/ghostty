@@ -16,6 +16,29 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         try await Task.sleep(for: .milliseconds(150))
     }
 
+    private func captureTTY(
+        _ app: XCUIApplication,
+        timeoutMs: Int = 2000,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> String {
+        app.typeText("tty | pbcopy")
+        app.typeKey("\n", modifierFlags: [])
+
+        let stepMs = 200
+        var waited = 0
+        while waited < timeoutMs {
+            try await Task.sleep(for: .milliseconds(stepMs))
+            let tty = try readPasteboardString(file: file, line: line).trimmingCharacters(in: .whitespacesAndNewlines)
+            if tty.hasPrefix("/dev/") { return tty }
+            waited += stepMs
+        }
+
+        let tty = try readPasteboardString(file: file, line: line).trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTFail("Expected tty path on pasteboard, got: \(tty)", file: file, line: line)
+        return tty
+    }
+
     private func rgbAtNormalizedPoint(_ image: NSImage, x: CGFloat, y: CGFloat) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return (0, 0, 0, 0)
@@ -155,17 +178,17 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         // Focus pane B and capture its PTY.
         clickPane(normalizedX: 0.75)
         try await cdTmp(app)
-        app.typeText("tty | pbcopy")
-        app.typeKey("\n", modifierFlags: [])
-        try await Task.sleep(for: .milliseconds(250))
-        let ttyB = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertTrue(ttyB.hasPrefix("/dev/"), "Expected tty path on pasteboard, got: \(ttyB)")
+        let ttyB = try await captureTTY(app)
 
-        // Focus pane A and write a single byte into pane B, then go quiet.
+        // Focus pane A and stream output into pane B for a short burst, then go quiet.
+        // This ensures output-idle attention ignores one-off redraws but still
+        // triggers for real "work output" bursts.
         clickPane(normalizedX: 0.25)
         try await cdTmp(app)
         try await Task.sleep(for: .milliseconds(200))
-        app.typeText("printf x > \(ttyB)")
+        // Keep this burst long enough to be considered "meaningful streaming"
+        // output by the output-idle heuristic.
+        app.typeText("(for i in 1 2 3 4 5 6 7; do printf x; sleep 0.12; done) > \(ttyB)")
         app.typeKey("\n", modifierFlags: [])
 
         func samplesForPaneBBorder(_ image: NSImage) -> [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] {
@@ -194,6 +217,186 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         XCTAssertTrue(
             lateSamples.contains(where: looksLikeBellBorder),
             "Expected pane B to show attention border after quiet period. samples=\(lateSamples)"
+        )
+    }
+
+    @MainActor
+    func testAttentionOnOutputIdleIgnoresSingleBurstRedrawLikeRemoteTmuxRefresh() async throws {
+        // Regression coverage: some background panes (notably SSH+tmux) can emit
+        // occasional redraw bursts (e.g. tmux refresh/status updates). Those
+        // should not be treated as "work finished" for attention-on-output-idle.
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+            auto-focus-attention = false
+            attention-on-output-idle = 1500ms
+            focus-follows-mouse = false
+
+            # Deterministic split creation.
+            keybind = cmd+d=new_split:right
+            keybind = cmd+shift+d=new_split:down
+
+            # Make screenshots easier to sample.
+            background-opacity = 1.0
+            background-blur = 0
+            background = #000000
+            foreground = #ffffff
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        func clickPane(_ x: CGFloat, _ y: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: y)).click()
+        }
+
+        // Create a 2x2 grid of panes.
+        window.typeKey("d", modifierFlags: .command) // split right
+        try await Task.sleep(for: .milliseconds(500))
+        clickPane(0.25, 0.25) // top-left
+        window.typeKey("d", modifierFlags: [.command, .shift]) // split down (left column)
+        try await Task.sleep(for: .milliseconds(500))
+        clickPane(0.75, 0.25) // top-right
+        window.typeKey("d", modifierFlags: [.command, .shift]) // split down (right column)
+        try await Task.sleep(for: .milliseconds(700))
+
+        // Preflight: make sure SSH works without prompting.
+        let host = uiTestSSHHost()
+        let sshBase = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \(host)"
+        let sshOK = try await runLocalCommandAndCaptureExitCode(app, cmd: "\(sshBase) 'true'")
+        guard sshOK == 0 else {
+            throw XCTSkip("SSH preflight failed (need key-based auth): exit=\(sshOK)")
+        }
+
+        // Start SSH + tmux in each pane, each using a dedicated tmux server name.
+        let id = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let panes: [(name: String, x: CGFloat, y: CGFloat)] = [
+            ("tl", 0.25, 0.25),
+            ("tr", 0.75, 0.25),
+            ("bl", 0.25, 0.75),
+            ("br", 0.75, 0.75),
+        ]
+        let servers = panes.map { "ghostty_ui_tmux_\(id)_\($0.name)" }
+
+        for (i, p) in panes.enumerated() {
+            clickPane(p.x, p.y)
+            // Start an interactive SSH session (already preflighted).
+            app.typeText("ssh -tt -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \(host)\n")
+            try await Task.sleep(for: .seconds(2))
+            // Start tmux with a dedicated server name so we can poke it from outside.
+            app.typeText("tmux -L \(servers[i]) new -A -s ghostty_test\n")
+            try await Task.sleep(for: .seconds(1))
+        }
+
+        // Focus top-left pane so the other three are unfocused.
+        clickPane(0.25, 0.25)
+        try await Task.sleep(for: .milliseconds(300))
+
+        // Trigger a single redraw burst to each unfocused tmux client from outside.
+        for server in [servers[1], servers[2], servers[3]] {
+            let rc = try await runLocalCommandAndCaptureExitCode(app, cmd: "\(sshBase) 'tmux -L \(server) refresh-client -S'")
+            XCTAssertEqual(rc, 0, "Expected tmux refresh-client to succeed for server \(server), rc=\(rc)")
+        }
+
+        // Wait longer than attention-on-output-idle. If we incorrectly treat a single
+        // redraw burst as actionable output, these panes will get an attention mark.
+        try await Task.sleep(for: .seconds(3))
+
+        let shot = window.screenshot()
+        let samples: [(r: UInt8, g: UInt8, b: UInt8, a: UInt8)] = [
+            // Left edge (top-left / bottom-left).
+            rgbAtNormalizedPoint(shot.image, x: 0.001, y: 0.25),
+            rgbAtNormalizedPoint(shot.image, x: 0.001, y: 0.75),
+            // Right edge (top-right / bottom-right).
+            rgbAtNormalizedPoint(shot.image, x: 0.999, y: 0.25),
+            rgbAtNormalizedPoint(shot.image, x: 0.999, y: 0.75),
+        ]
+
+        XCTAssertFalse(
+            samples.contains(where: looksLikeBellBorder),
+            "Expected no attention border from single redraw bursts in unfocused SSH+tmux panes. samples=\(samples)"
+        )
+
+        // Best-effort cleanup: kill tmux servers (ignore failures).
+        for server in servers {
+            _ = try? await runLocalCommandAndCaptureExitCode(app, cmd: "\(sshBase) 'tmux -L \(server) kill-server'")
+        }
+    }
+
+    @MainActor
+    func testAttentionOnOutputIdleIgnoresShortBurstLikeLsInUnfocusedPane() async throws {
+        // Repro coverage: short command output in background panes (e.g. `ls` in
+        // SSH/tmux) should not be treated as "work finished" for output-idle
+        // attention. This prevents spurious attention marks from quick redraws.
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+            auto-focus-attention = false
+            attention-on-output-idle = 1500ms
+            focus-follows-mouse = false
+
+            background-opacity = 1.0
+            background-blur = 0
+            background = #000000
+            foreground = #ffffff
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        // Create a second split (two panes).
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(600))
+
+        func clickPane(normalizedX: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: normalizedX, dy: 0.75)).click()
+        }
+
+        // Focus pane B and capture its PTY so we can write output into it while unfocused.
+        clickPane(normalizedX: 0.75)
+        try await cdTmp(app)
+        let ttyB = try await captureTTY(app)
+
+        // Focus pane A. Pane B is now unfocused.
+        clickPane(normalizedX: 0.25)
+        try await cdTmp(app)
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Emit a short burst of output into pane B (multiple small writes over <500ms).
+        app.typeText("(for i in 1 2 3 4 5 6 7 8 9 10; do printf x > \(ttyB); sleep 0.02; done)")
+        app.typeKey("\n", modifierFlags: [])
+
+        // Wait longer than attention-on-output-idle and then ensure pane B doesn't get a bell border.
+        try await Task.sleep(for: .seconds(3))
+
+        let shot = window.screenshot()
+        // Pane B is on the right edge. Sample close to right edge for border pixels.
+        let samples = [
+            rgbAtNormalizedPoint(shot.image, x: 0.999, y: 0.35),
+            rgbAtNormalizedPoint(shot.image, x: 0.999, y: 0.50),
+            rgbAtNormalizedPoint(shot.image, x: 0.999, y: 0.65),
+        ]
+        XCTAssertFalse(
+            samples.contains(where: looksLikeBellBorder),
+            "Expected short burst output to NOT trigger attention-on-output-idle. samples=\(samples)"
         )
     }
 
@@ -306,27 +509,18 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         window.typeKey("2", modifierFlags: .command)
         try await Task.sleep(for: .milliseconds(250))
         try await cdTmp(app)
-        app.typeText("tty | pbcopy\n")
-        try await Task.sleep(for: .milliseconds(250))
-        let ttyTab2 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertTrue(ttyTab2.hasPrefix("/dev/"), "Expected tty path for tab 2, got: \(ttyTab2)")
+        let ttyTab2 = try await captureTTY(app)
 
         window.typeKey("3", modifierFlags: .command)
         try await Task.sleep(for: .milliseconds(250))
         try await cdTmp(app)
-        app.typeText("tty | pbcopy\n")
-        try await Task.sleep(for: .milliseconds(250))
-        let ttyTab3 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertTrue(ttyTab3.hasPrefix("/dev/"), "Expected tty path for tab 3, got: \(ttyTab3)")
+        let ttyTab3 = try await captureTTY(app)
 
         // Back to tab 1.
         window.typeKey("1", modifierFlags: .command)
         try await Task.sleep(for: .milliseconds(250))
         try await cdTmp(app)
-        app.typeText("tty | pbcopy\n")
-        try await Task.sleep(for: .milliseconds(250))
-        let ttyTab1 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertTrue(ttyTab1.hasPrefix("/dev/"), "Expected tty path for tab 1, got: \(ttyTab1)")
+        let ttyTab1 = try await captureTTY(app)
 
         // Ring tab 3 then tab 2 shortly after. Tab 2 is most recent and should
         // be the final auto-focused surface.
@@ -350,6 +544,116 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         try await Task.sleep(for: .milliseconds(250))
         let ttyAfterResume = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
         XCTAssertEqual(ttyAfterResume, ttyTab2, "Expected auto-focus to end on tab 2 (\(ttyTab2)) after unfocus, got \(ttyAfterResume)")
+    }
+
+    @MainActor
+    func testAutoFocusDoesNotStealFocusAwayFromJustAutoFocusedTab() async throws {
+        // Regression coverage: if auto-focus brings us to a tab due to attention,
+        // subsequent attention in other tabs must not immediately steal focus away
+        // while the user is reading (even if they don't move the mouse).
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+
+            auto-focus-attention = true
+            auto-focus-attention-idle = 200ms
+            auto-focus-attention-resume-delay = 0ms
+            auto-focus-attention-resume-on-surface-switch = true
+            attention-clear-on-focus = true
+            attention-debug = true
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        // Create tab 2.
+        window.typeKey("t", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(250))
+
+        // Capture tty for tab 1 and tab 2.
+        window.typeKey("1", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(250))
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyTab1 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(ttyTab1.hasPrefix("/dev/"), "Expected tty path for tab 1, got: \(ttyTab1)")
+
+        window.typeKey("2", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(250))
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyTab2 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(ttyTab2.hasPrefix("/dev/"), "Expected tty path for tab 2, got: \(ttyTab2)")
+
+        // Back to tab 1.
+        window.typeKey("1", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(250))
+        try await cdTmp(app)
+
+        // Ring tab 2 while tab 1 is focused. Auto-focus is paused while "reading"
+        // the focused surface. We'll then signal "not interested" by moving the
+        // mouse out of the focused pane, which allows auto-focus to run.
+        app.typeText("(sleep 0.10; printf '\\a' > \(ttyTab2)) &\n")
+        try await Task.sleep(for: .milliseconds(1200))
+
+        let overlay = app.otherElements["Ghostty.Attention.Overlay"]
+        XCTAssertTrue(overlay.waitForExistence(timeout: 2), "Expected attention overlay to exist when attention-debug=true")
+        XCTAssertNotEqual(overlay.label, "idle", "Expected auto-focus to be pending/paused after ringing tab 2. overlay=\(overlay.label)")
+
+        // Signal "not interested" by moving mouse focus out of the surface.
+        let dragStart = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
+        let dragEnd = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -0.20))
+        dragStart.press(forDuration: 0.05, thenDragTo: dragEnd)
+        try await Task.sleep(for: .seconds(3))
+
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyAfterFocus = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        let overlayText = overlay.exists ? overlay.label : "<no overlay>"
+        XCTAssertEqual(ttyAfterFocus, ttyTab2, "Expected auto-focus to move to tab 2 (\(ttyTab2)), got \(ttyAfterFocus). overlay=\(overlayText)")
+
+        // Ensure mouse is outside the focused surface to reproduce the bug where
+        // auto-focus could steal focus again even without user interaction.
+        let dragStart2 = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75))
+        let dragEnd2 = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -0.20))
+        dragStart2.press(forDuration: 0.05, thenDragTo: dragEnd2)
+        try await Task.sleep(for: .milliseconds(200))
+
+        // Now ring tab 1 while we're reading tab 2. Auto-focus must NOT steal focus back.
+        app.typeText("printf '\\a' > \(ttyTab1)\n")
+        try await Task.sleep(for: .seconds(2))
+
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyStillTab2 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(
+            ttyStillTab2,
+            ttyTab2,
+            "Expected auto-focus to remain on tab 2 while reading; got \(ttyStillTab2). overlay=\(overlay.label)"
+        )
+
+        // Signal "done reading" by switching to another surface (resume-on-surface-switch).
+        // This clears the focus lock and allows auto-focus to run immediately.
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .seconds(2))
+
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyAfterResume = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(
+            ttyAfterResume,
+            ttyTab1,
+            "Expected auto-focus to resume and focus tab 1 (\(ttyTab1)) after unfocus, got \(ttyAfterResume). overlay=\(overlay.label)"
+        )
     }
 
     @MainActor
@@ -1089,6 +1393,24 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             throw XCTSkip("Pasteboard empty")
         }
         return s
+    }
+
+    private func runLocalCommandAndCaptureExitCode(
+        _ app: XCUIApplication,
+        cmd: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> Int {
+        app.typeText("\(cmd); echo $? | pbcopy")
+        app.typeKey("\n", modifierFlags: [])
+        try await Task.sleep(for: .milliseconds(400))
+
+        let s = try readPasteboardString(file: file, line: line).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let code = Int(s) else {
+            XCTFail("Expected exit code on pasteboard, got: \(s)", file: file, line: line)
+            return 999
+        }
+        return code
     }
 
     // opencode E2E coverage lives in GhosttyOpencodeE2ETests so it can opt out
