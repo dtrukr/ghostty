@@ -1260,6 +1260,21 @@ command: ?Command = null,
 /// Available since 1.4.0.
 @"auto-focus-attention-idle": Duration = .{ .duration = 5 * std.time.ns_per_s },
 
+/// The delay (after leaving the focused surface) before Ghostty will perform an
+/// `auto-focus-attention` action.
+///
+/// This is useful in combination with "pause while focused" behavior: as long
+/// as a surface has focus, Ghostty will not auto-focus to attention marks.
+/// Once focus leaves the surface, Ghostty will wait this duration and then
+/// focus the most recent surface that needs attention (if any).
+///
+/// Set to `0` to focus immediately on unfocus.
+///
+/// macOS only.
+///
+/// Available since 1.4.0.
+@"auto-focus-attention-resume-delay": Duration = .{ .duration = 0 },
+
 /// If true (default), Ghostty clears the "needs attention" state as soon as a
 /// surface gains focus (e.g. after `goto_attention` or auto-focus-attention).
 ///

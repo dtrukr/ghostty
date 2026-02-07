@@ -156,17 +156,18 @@ pub const StreamHandler = struct {
         if (!self.smart_background_enabled) return;
 
         if (self.terminal.getPwd()) |pwd| {
-            self.smart_key_hash = smart_background.hashKey(
+            var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+            var stack_alloc = std.heap.stackFallback(512, arena_alloc.allocator());
+            defer arena_alloc.deinit();
+
+            const key_path = smart_background.keyPathAlloc(
+                stack_alloc.get(),
                 self.smart_background_key,
-                null,
                 pwd,
                 true,
-            );
-            const key_path = smart_background.keyPath(
-                self.smart_background_key,
-                pwd,
-                true,
-            );
+            ) catch smart_background.keyPath(self.smart_background_key, pwd, true);
+
+            self.smart_key_hash = smart_background.hashKeyFromKeyPath(null, key_path);
             self.smartBackgroundNotifyKey(key_path);
         }
 
@@ -186,17 +187,18 @@ pub const StreamHandler = struct {
 
         // If we don't have a key yet but do have a trusted pwd, use it.
         if (self.smart_key_hash == null) if (self.terminal.getPwd()) |pwd| {
-            self.smart_key_hash = smart_background.hashKey(
+            var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+            var stack_alloc = std.heap.stackFallback(512, arena_alloc.allocator());
+            defer arena_alloc.deinit();
+
+            const key_path = smart_background.keyPathAlloc(
+                stack_alloc.get(),
                 self.smart_background_key,
-                null,
                 pwd,
                 true,
-            );
-            const key_path = smart_background.keyPath(
-                self.smart_background_key,
-                pwd,
-                true,
-            );
+            ) catch smart_background.keyPath(self.smart_background_key, pwd, true);
+
+            self.smart_key_hash = smart_background.hashKeyFromKeyPath(null, key_path);
             self.smartBackgroundNotifyKey(key_path);
         };
 
@@ -212,17 +214,21 @@ pub const StreamHandler = struct {
         if (!self.smart_background_enabled) return;
 
         const host_for_hash: ?[]const u8 = if (trusted_local) null else host;
-        const key_path = smart_background.keyPath(
+        var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+        var stack_alloc = std.heap.stackFallback(512, arena_alloc.allocator());
+        defer arena_alloc.deinit();
+
+        const key_path = smart_background.keyPathAlloc(
+            stack_alloc.get(),
+            self.smart_background_key,
+            path,
+            trusted_local,
+        ) catch smart_background.keyPath(
             self.smart_background_key,
             path,
             trusted_local,
         );
-        self.smart_key_hash = smart_background.hashKey(
-            self.smart_background_key,
-            host_for_hash,
-            path,
-            trusted_local,
-        );
+        self.smart_key_hash = smart_background.hashKeyFromKeyPath(host_for_hash, key_path);
         self.smartBackgroundNotifyKeyLabel(host, key_path, trusted_local);
 
         self.applySmartBackground();
@@ -566,6 +572,20 @@ pub const StreamHandler = struct {
     fn dcsCommand(self: *StreamHandler, cmd: *terminal.dcs.Command) !void {
         // log.warn("DCS command: {}", .{cmd});
         switch (cmd.*) {
+            .tmux_passthrough => |*v| {
+                // Tmux passthrough (DCS "tmux;") contains an embedded byte stream
+                // that should be interpreted as if it arrived directly. To avoid
+                // recursive error inference (handler -> stream -> handler), we
+                // only parse OSC sequences here (primarily OSC 7 for cwd hints),
+                // which is the common tmux passthrough use in Ghostty.
+                const payload = v.data.written();
+                if (payload.len == 0) return;
+
+                self.handleTmuxPassthroughPayload(payload) catch |err| {
+                    log.warn("tmux passthrough parse failed err={}", .{err});
+                };
+            },
+
             .tmux => |tmux| tmux: {
                 // If tmux control mode is disabled at the build level,
                 // then this whole block shouldn't be analyzed.
@@ -718,6 +738,47 @@ pub const StreamHandler = struct {
                 const msg = try termio.Message.writeReq(self.alloc, response[0..stream.pos]);
                 self.messageWriter(msg);
             },
+        }
+    }
+
+    fn handleTmuxPassthroughPayload(self: *StreamHandler, payload: []const u8) !void {
+        // Scan for OSC sequences (ESC ] ... BEL or ST) and dispatch them through
+        // our existing handlers.
+        var i: usize = 0;
+        while (i + 1 < payload.len) : (i += 1) {
+            if (payload[i] != 0x1B or payload[i + 1] != ']') continue;
+
+            i += 2; // skip ESC ]
+            var p = terminal.osc.Parser.init(self.alloc);
+            defer p.deinit();
+
+            while (i < payload.len) {
+                const c = payload[i];
+
+                // BEL terminator
+                if (c == 0x07) {
+                    if (p.end(c)) |cmd| try self.oscCommand(cmd.*);
+                    break;
+                }
+
+                // ST terminator: ESC \
+                if (c == 0x1B and i + 1 < payload.len and payload[i + 1] == '\\') {
+                    if (p.end('\\')) |cmd| try self.oscCommand(cmd.*);
+                    i += 1; // extra increment for the '\' below
+                    break;
+                }
+
+                p.next(c);
+                i += 1;
+            }
+        }
+    }
+
+    fn oscCommand(self: *StreamHandler, cmd: terminal.osc.Command) !void {
+        // Only handle the subset we care about for passthrough today.
+        switch (cmd) {
+            .report_pwd => |v| try self.reportPwd(v.value),
+            else => {},
         }
     }
 
@@ -1392,8 +1453,15 @@ pub const StreamHandler = struct {
 
         // Update our smart background tinting. We do this regardless of host
         // validity so that SSH/tmux sessions can still provide useful visual
-        // context without trusting the path for filesystem actions.
-        self.smartBackgroundUpdateFromCwd(host_opt, path, host_valid);
+        // context.
+        //
+        // Many prompts omit a host in OSC 7. For smart background keying only,
+        // treat a missing host as "trusted local" so `.project` mode can use
+        // VCS roots (and Git worktree unification) without requiring hostname
+        // validation. We still only update the terminal's "trusted" pwd when
+        // the host is validated local.
+        const trusted_for_smart_bg = host_valid or host_opt == null;
+        self.smartBackgroundUpdateFromCwd(host_opt, path, trusted_for_smart_bg);
 
         // Only update the "trusted" pwd when the host is local.
         if (!host_valid) {

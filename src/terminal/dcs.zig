@@ -50,6 +50,21 @@ pub const Handler = struct {
     fn tryHook(self: Handler, alloc: Allocator, dcs: DCS) !?Hook {
         return switch (dcs.intermediates.len) {
             0 => switch (dcs.final) {
+                // Tmux passthrough wrapper: ESC P tmux; <payload> ESC \\
+                //
+                // In DCS terms this hooks with final 't' and then the payload
+                // begins with "mux;".
+                't' => .{
+                    .state = .{
+                        .tmux_passthrough = .{
+                            .buffer = try .initCapacity(
+                                alloc,
+                                256, // Small initial capacity; payload is typically small (OSC, etc.)
+                            ),
+                        },
+                    },
+                },
+
                 // Tmux control mode
                 'p' => tmux: {
                     if (comptime !build_options.tmux_control_mode) {
@@ -133,6 +148,44 @@ pub const Handler = struct {
                 };
             } else unreachable,
 
+            .tmux_passthrough => |*tmux| {
+                // Confirm the "mux;" prefix first. The DCS hook final is 't',
+                // so the first bytes we see here should be "mux;".
+                const prefix = "mux;";
+                if (tmux.prefix_i < prefix.len) {
+                    if (byte != prefix[tmux.prefix_i]) {
+                        // Not a tmux passthrough; ignore rest of this DCS.
+                        return error.InvalidData;
+                    }
+                    tmux.prefix_i += 1;
+                    return null;
+                }
+
+                if (tmux.buffer.written().len >= self.max_bytes) {
+                    return error.OutOfMemory;
+                }
+
+                // Tmux encodes ESC as ESC ESC inside the payload.
+                if (tmux.saw_esc) {
+                    tmux.saw_esc = false;
+                    if (byte == 0x1B) {
+                        try tmux.buffer.writer.writeByte(0x1B);
+                    } else {
+                        // Best-effort: preserve the bytes even if encoding is odd.
+                        try tmux.buffer.writer.writeByte(0x1B);
+                        try tmux.buffer.writer.writeByte(byte);
+                    }
+                    return null;
+                }
+
+                if (byte == 0x1B) {
+                    tmux.saw_esc = true;
+                    return null;
+                }
+
+                try tmux.buffer.writer.writeByte(byte);
+            },
+
             .xtgettcap => |*list| {
                 if (list.written().len >= self.max_bytes) {
                     return error.OutOfMemory;
@@ -169,6 +222,8 @@ pub const Handler = struct {
                 self.state.deinit();
                 break :tmux .{ .tmux = .exit };
             } else unreachable,
+
+            .tmux_passthrough => |*buf| .{ .tmux_passthrough = .{ .data = buf.buffer } },
 
             .xtgettcap => |*list| xtgettcap: {
                 // Note: purposely do not deinit our state here because
@@ -211,6 +266,13 @@ pub const Command = union(enum) {
     /// DECRQSS
     decrqss: DECRQSS,
 
+    /// Tmux passthrough wrapper (DCS `tmux;` ... ST), decoded into raw bytes that
+    /// should be re-parsed as if they arrived on the terminal stream directly.
+    ///
+    /// This is used by tmux to forward OSC sequences (such as OSC 7) through an
+    /// intermediate tmux session.
+    tmux_passthrough: TmuxPassthrough,
+
     /// Tmux control mode
     tmux: if (build_options.tmux_control_mode)
         terminal.tmux.ControlNotification
@@ -221,6 +283,7 @@ pub const Command = union(enum) {
         switch (self.*) {
             .xtgettcap => |*v| v.data.deinit(),
             .decrqss => {},
+            .tmux_passthrough => |*v| v.data.deinit(),
             .tmux => {},
         }
     }
@@ -255,6 +318,10 @@ pub const Command = union(enum) {
         decstbm,
         decslrm,
     };
+
+    pub const TmuxPassthrough = struct {
+        data: std.Io.Writer.Allocating,
+    };
 };
 
 const State = union(enum) {
@@ -280,6 +347,16 @@ const State = union(enum) {
     else
         void,
 
+    /// Tmux passthrough wrapper: DCS `tmux;` ... ST.
+    ///
+    /// Tmux encodes ESC as ESC ESC in the payload; we decode that so the
+    /// resulting bytes can be fed back into the terminal stream parser.
+    tmux_passthrough: struct {
+        buffer: std.Io.Writer.Allocating,
+        prefix_i: u3 = 0, // "mux;" (after the DCS final 't')
+        saw_esc: bool = false,
+    },
+
     pub fn deinit(self: *State) void {
         switch (self.*) {
             .inactive,
@@ -291,6 +368,7 @@ const State = union(enum) {
             .tmux => |*v| if (comptime build_options.tmux_control_mode) {
                 v.deinit();
             } else unreachable,
+            .tmux_passthrough => |*v| v.buffer.deinit(),
         }
     }
 };

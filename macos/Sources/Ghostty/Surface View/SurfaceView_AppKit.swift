@@ -215,7 +215,7 @@ extension Ghostty {
         var notificationIdentifiers: Set<String> = []
 
         private var markedText: NSMutableAttributedString
-        private(set) var focused: Bool = true
+        @Published private(set) var focused: Bool = true
         private var prevPressureStage: Int = 0
         private var appearanceObserver: NSKeyValueObservation? = nil
 
@@ -807,12 +807,16 @@ extension Ghostty {
         }
 
         override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+
             // To update our tracking area we just recreate it all.
             trackingAreas.forEach { removeTrackingArea($0) }
 
             // This tracking area is across the entire frame to notify us of mouse movements.
             addTrackingArea(NSTrackingArea(
-                rect: frame,
+                // NSTrackingArea rect is in the view's coordinate system; `bounds`
+                // keeps enter/exit reliable regardless of the view's position.
+                rect: bounds,
                 options: [
                     .mouseEnteredAndExited,
                     .mouseMoved,
@@ -963,6 +967,12 @@ extension Ghostty {
         override func mouseEntered(with event: NSEvent) {
             super.mouseEntered(with: event)
 
+            if let window,
+               let controller = window.windowController as? BaseTerminalController
+            {
+                controller.surfaceMouseInsideDidChange(surface: self, inside: true)
+            }
+
             guard let surfaceModel else { return }
 
             // On mouse enter we need to reset our cursor position. This is
@@ -979,6 +989,12 @@ extension Ghostty {
         }
 
         override func mouseExited(with event: NSEvent) {
+            if let window,
+               let controller = window.windowController as? BaseTerminalController
+            {
+                controller.surfaceMouseInsideDidChange(surface: self, inside: false)
+            }
+
             guard let surfaceModel else { return }
 
             // If the mouse is being dragged then we don't have to emit

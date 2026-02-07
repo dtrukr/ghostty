@@ -35,6 +35,9 @@ protocol TerminalViewModel: ObservableObject {
     
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// Attention engine status overlay (debug UI).
+    var attentionOverlayText: String { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -119,7 +122,9 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                 
                 // Show update information above all else.
                 if viewModel.updateOverlayIsVisible {
-                    UpdateOverlay()
+                    StatusOverlays(showUpdate: true, attentionText: ghostty.config.attentionDebug ? viewModel.attentionOverlayText : nil)
+                } else if ghostty.config.attentionDebug, !viewModel.attentionOverlayText.isEmpty {
+                    StatusOverlays(showUpdate: false, attentionText: viewModel.attentionOverlayText)
                 }
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
@@ -127,20 +132,58 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
     }
 }
 
-fileprivate struct UpdateOverlay: View {
+fileprivate struct StatusOverlays: View {
+    let showUpdate: Bool
+    let attentionText: String?
+
     var body: some View {
-        if let appDelegate = NSApp.delegate as? AppDelegate {
-            VStack {
+        VStack {
+            Spacer()
+
+            HStack {
                 Spacer()
-                
-                HStack {
-                    Spacer()
-                    UpdatePill(model: appDelegate.updateViewModel)
-                        .padding(.bottom, 9)
-                        .padding(.trailing, 9)
+
+                VStack(alignment: .trailing, spacing: 8) {
+                    if let attentionText, !attentionText.isEmpty {
+                        AttentionPill(text: attentionText)
+                    }
+
+                    if showUpdate, let appDelegate = NSApp.delegate as? AppDelegate {
+                        UpdatePill(model: appDelegate.updateViewModel)
+                    }
                 }
+                .padding(.bottom, 9)
+                .padding(.trailing, 9)
             }
         }
+        .allowsHitTesting(false)
+    }
+}
+
+fileprivate struct AttentionPill: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "bell")
+                .font(.system(size: 11, weight: .semibold))
+            Text(verbatim: text)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.regularMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
+                }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("Ghostty.Attention.Overlay")
+        .accessibilityLabel(text)
     }
 }
 
