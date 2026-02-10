@@ -1614,6 +1614,8 @@ class BaseTerminalController: NSWindowController,
         // Counts per provider across the tab group.
         var counts: [AgentProvider: (waiting: Int, idle: Int, running: Int)] = [:]
         for (_, v) in stable {
+            // Keep "unknown" internal only; do not show it in the debug overlay.
+            if v.provider == .unknown { continue }
             var c = counts[v.provider] ?? (waiting: 0, idle: 0, running: 0)
             switch v.status {
             case .waiting: c.waiting += 1
@@ -1624,7 +1626,7 @@ class BaseTerminalController: NSWindowController,
         }
 
         // Stable ordering (most useful first).
-        let order: [AgentProvider] = [.codex, .opencode, .claude, .vibe, .gemini, .unknown]
+        let order: [AgentProvider] = [.codex, .opencode, .claude, .vibe, .gemini]
 
         // Emojis to keep it compact:
         // - waiting: ⏳

@@ -142,6 +142,37 @@ For smart background, Ghostty intentionally updates tinting even when OSC 7 is
 "untrusted" (host not local). The untrusted cwd hint is used only for visual
 context; it does not update the trusted `pwd` for filesystem behaviors.
 
+Practical notes for SSH + tmux:
+
+- SSH: Ghostty's shell integration wraps `ssh` (when enabled via
+  `shell-integration-features`) and proactively emits an OSC 7 before entering
+  SSH that encodes the remote hostname into the _path_ (for example
+  `kitty-shell-cwd:///ssh/<host><PWD>`). This ensures smart-background changes
+  immediately even if later layers (such as remote tmux) stop forwarding OSC 7.
+- tmux: OSC sequences (including OSC 7 cwd updates) are often filtered inside
+  tmux sessions. To keep smart-background updating _inside tmux_, Ghostty's
+  shell integration will wrap OSC 7 in a tmux passthrough DCS when `$TMUX` is
+  set. For this to work, tmux passthrough must be enabled.
+
+Recommended `~/.tmux.conf`:
+
+```tmux
+# Allow passthrough of DCS-wrapped sequences (used to forward OSC 7 cwd updates)
+set -g allow-passthrough on
+```
+
+Troubleshooting: "I have pane A and pane B in the same local folder; I SSH and
+tmux, and the background stays the same"
+
+- Ensure shell integration is enabled and includes SSH integration.
+  - Example: `shell-integration-features = ssh-env,ssh-terminfo`
+- Ensure shell integration is actually loaded in the shell that is running
+  _inside tmux_.
+  - For zsh, note the comment in `src/shell-integration/zsh/ghostty-integration`:
+    shells started via `tmux` may not automatically source integration unless
+    you add it to your `.zshrc`.
+- Enable tmux passthrough (`allow-passthrough on`) so OSC 7 can reach Ghostty.
+
 ## Attention: Implementation Details
 
 ### Concepts
@@ -206,6 +237,32 @@ short window immediately after a resize:
 - `src/termio/Thread.zig`
   - on `.resize`, record `output_idle_last_resize = now`
   - on `.output_activity` (unfocused), ignore if last resize was within ~250ms
+
+#### Short-Burst Suppression (Bug Fix)
+
+Some panes (notably SSH + tmux, and some TUIs) can emit occasional small redraw
+bursts even when "nothing is happening" (for example a one-shot refresh). With
+`attention-on-output-idle` enabled, these bursts can incorrectly arm the idle
+timer and then later mark attention.
+
+Ghostty suppresses output-idle attention for "short bursts" of output:
+
+- It tracks the time of the first/last output event and the number of distinct
+  output events.
+- When the quiet timer fires, if the output looked like a short burst (few
+  events and a short span), it disarms without marking attention.
+
+This makes `attention-on-output-idle` behave more like "a background pane was
+doing meaningful work and then stopped" rather than "a background pane drew
+something once and then went quiet".
+
+Tradeoff: very short commands that print a tiny amount of output (like `ls`)
+may not produce output-idle attention marks anymore. In that case you typically
+want one of the other attention sources:
+
+- `notify-on-command-finish` (OSC 133 shell integration)
+- desktop notifications (OSC 9 / OSC 777)
+- app-emitted BEL
 
 ### Focus Cycling / Auto-Focus (macOS)
 
@@ -279,6 +336,20 @@ Notes:
   pane. For predictable behavior, prefer `focus-follows-mouse = false`.
 - Auto-focus prioritizes attention candidates within the current tab first, and
   only falls back to other tabs when the current tab has no candidates.
+
+Debug overlay interpretation (when `attention-debug = true`):
+
+- `paused(focused): pending`
+  - Attention is pending, but auto-focus is paused because a terminal surface
+    is focused and the mouse is inside it.
+- `paused(lock ....): pending`
+  - Auto-focus previously focused a surface and is holding a focus lock to
+    avoid bouncing away while you read, even if the mouse isn't moving.
+- `resume in <N>ms (<reason>)`
+  - Focus pause is lifted and Ghostty is waiting out `auto-focus-attention-resume-delay`
+    as a debounced quiet-period.
+- `idleWait <N>ms`
+  - No surface is focused; Ghostty is waiting out `auto-focus-attention-idle`.
 
 The attention border itself is rendered by:
 
