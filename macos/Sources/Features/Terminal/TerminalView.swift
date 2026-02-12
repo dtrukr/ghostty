@@ -150,6 +150,11 @@ fileprivate struct StatusOverlays: View {
     let attentionText: String?
     let agentText: String?
 
+    private let trailingInset: CGFloat = 9
+    private let baseBottomInset: CGFloat = 9
+    private let diagnosticsLift: CGFloat = 40
+    private let diagnosticsInterPillSpacing: CGFloat = 6
+
     var body: some View {
         VStack {
             Spacer()
@@ -158,20 +163,25 @@ fileprivate struct StatusOverlays: View {
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 8) {
-                    if let attentionText, !attentionText.isEmpty {
-                        AttentionPill(text: attentionText)
-                    }
+                    if (attentionText?.isEmpty == false) || (agentText?.isEmpty == false) {
+                        VStack(alignment: .trailing, spacing: 0) {
+                            if let attentionText, !attentionText.isEmpty {
+                                AttentionPill(text: attentionText)
+                                    .padding(.bottom, (agentText?.isEmpty == false) ? diagnosticsInterPillSpacing : 0)
+                            }
 
-                    if let agentText, !agentText.isEmpty {
-                        AgentStatusPill(text: agentText)
+                            if let agentText, !agentText.isEmpty {
+                                AgentStatusPill(text: agentText)
+                            }
+                        }
+                        .padding(.bottom, baseBottomInset + diagnosticsLift)
                     }
 
                     if showUpdate, let appDelegate = NSApp.delegate as? AppDelegate {
                         UpdatePill(model: appDelegate.updateViewModel)
                     }
                 }
-                .padding(.bottom, 9)
-                .padding(.trailing, 9)
+                .padding(.trailing, trailingInset)
             }
         }
         .allowsHitTesting(false)
@@ -187,7 +197,8 @@ fileprivate struct AttentionPill: View {
                 .font(.system(size: 11, weight: .semibold))
             Text(verbatim: text)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .lineLimit(1)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)

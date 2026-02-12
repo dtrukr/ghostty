@@ -58,6 +58,19 @@ extension Ghostty {
         /// True when the surface should show a highlight effect (e.g., when presented via goto_split).
         @Published private(set) var highlighted: Bool = false
 
+        enum AgentBadgeSource: String {
+            case none
+            case detected
+            case marked
+            case diagnostic
+        }
+
+        /// Provider text shown in the per-surface agent badge (empty when hidden).
+        @Published private(set) var attentionAgentBadgeProvider: String = ""
+
+        /// Source shown in the per-surface agent badge.
+        @Published private(set) var attentionAgentBadgeSource: AgentBadgeSource = .none
+
         // Returns sizing information for the surface. This is the raw C
         // structure because I'm lazy.
         var surfaceSize: ghostty_surface_size_s? {
@@ -120,6 +133,33 @@ extension Ghostty {
                 UInt32(size.width * scale),
                 UInt32(size.height * scale)
             )
+        }
+
+        func setAttentionAgentBadge(provider: String, source: AgentBadgeSource) {
+            let normalized = provider
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !normalized.isEmpty else {
+                clearAttentionAgentBadge()
+                return
+            }
+            if attentionAgentBadgeProvider == normalized,
+               attentionAgentBadgeSource == source
+            {
+                return
+            }
+            attentionAgentBadgeProvider = normalized
+            attentionAgentBadgeSource = source
+        }
+
+        func clearAttentionAgentBadge() {
+            if attentionAgentBadgeProvider.isEmpty,
+               attentionAgentBadgeSource == .none
+            {
+                return
+            }
+            attentionAgentBadgeProvider = ""
+            attentionAgentBadgeSource = .none
         }
 
         // MARK: UIView

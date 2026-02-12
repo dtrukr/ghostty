@@ -90,6 +90,9 @@ class BaseTerminalController: NSWindowController,
     /// The cancellables related to our focused surface.
     private var focusedSurfaceCancellables: Set<AnyCancellable> = []
 
+    // Bell-state subscriptions for all surfaces in this controller.
+    private var surfaceBellCancellables: Set<AnyCancellable> = []
+
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? = nil {
@@ -134,29 +137,88 @@ class BaseTerminalController: NSWindowController,
     /// explicit "I'm reading/using this pane" signal to pause auto-focus.
     private var autoFocusAttentionMouseInsideFocusedSurface: Bool = true
 
+
+    /// Debug-only metadata used to render live attention countdown + next action.
+    private var attentionOverlayHint: String = "idle"
+    private var attentionOverlayPlanDeadlineUptime: TimeInterval? = nil
+    private var attentionOverlayPlanReason: String? = nil
     /// Last cycled attention surface per tab group, so cycling continues smoothly
     /// when it crosses tabs.
     private static var attentionCycleState: [ObjectIdentifier: UUID] = [:]
 
-    // MARK: Agent Status Detection (Debug)
+    // MARK: Agent Detection / Surface Badges
 
     private enum AgentProvider: String, CaseIterable {
-        case codex, opencode, claude, vibe, gemini, unknown
+        case codex
+        case opencode
+        case ag_tui = "ag-tui"
+        case claude
+        case vibe
+        case gemini
+        case unknown
     }
 
     private enum AgentStatus: String {
         case running, waiting, idle
     }
 
+    private enum AgentDetectionSource: String {
+        case none
+        case marked
+        case title
+        case viewport
+        case diagnostic
+    }
+
     private struct AgentObservedState {
         var provider: AgentProvider
         var status: AgentStatus
+        var badgeProvider: String?
+        var source: AgentDetectionSource
         var sinceUptime: TimeInterval
     }
 
+    private struct AgentStableState {
+        var provider: AgentProvider
+        var status: AgentStatus
+        var badgeProvider: String?
+        var source: AgentDetectionSource
+    }
+
+    private struct AgentProviderLockState {
+        var provider: AgentProvider
+        var mismatchProvider: AgentProvider = .unknown
+        var mismatchCount: Int = 0
+        var unknownIdlePromptCount: Int = 0
+        var unknownStreakCount: Int = 0
+        var lastPositiveEvidenceUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    }
+
+    private let agentProviderLockSwitchPolls: Int = 3
+    private let agentProviderLockPromptClearPolls: Int = 3
+    private let agentProviderLockUnknownClearPolls: Int = 6
+
     private var agentStatusTimer: Timer? = nil
     private var agentObserved: [UUID: AgentObservedState] = [:]
-    private var agentStable: [UUID: (provider: AgentProvider, status: AgentStatus)] = [:]
+    private var agentStable: [UUID: AgentStableState] = [:]
+    private var agentProviderLocks: [UUID: AgentProviderLockState] = [:]
+    private var agentUnknownScanCursor: Int = 0
+
+    // Focused-surface autodetection trace (on-demand diagnostics).
+    private var focusedAgentTraceEnabled: Bool = false
+    private var focusedAgentTraceStartedAt: Date? = nil
+    private var focusedAgentTracePollIndex: UInt64 = 0
+    private var focusedAgentTraceLines: [String] = []
+    private var focusedAgentTraceLastViewportHash: Int? = nil
+    private var focusedAgentTraceLastSurfaceId: UUID? = nil
+    private var focusedAgentTraceAutoExportWorkItem: DispatchWorkItem? = nil
+    private var agentDebugLogAutoExportWorkItem: DispatchWorkItem? = nil
+
+    private let focusedAgentTraceAutoCaptureSeconds: TimeInterval = 5.0
+
+    var focusedAgentTraceActive: Bool {
+        focusedAgentTraceEnabled
+    }
 
     /// The time that undo/redo operations that contain running ptys are valid for.
     var undoExpiration: Duration {
@@ -298,7 +360,10 @@ class BaseTerminalController: NSWindowController,
             ]
         ) { [weak self] event in self?.localEventHandler(event) }
 
-        // Agent status overlay is debug-only; keep it inactive unless enabled.
+        // Bell changes drive transient tab-level attention highlighting.
+        rebindSurfaceBellObservers()
+
+        // Start/stop agent detection (debug overlay and/or per-surface badges).
         syncAgentStatusDetection()
     }
 
@@ -309,6 +374,9 @@ class BaseTerminalController: NSWindowController,
             NSEvent.removeMonitor(eventMonitor)
         }
         agentStatusTimer?.invalidate()
+        focusedAgentTraceAutoExportWorkItem?.cancel()
+        agentDebugLogAutoExportWorkItem?.cancel()
+        focusedAgentTraceEnabled = false
     }
 
     // MARK: Methods
@@ -364,6 +432,11 @@ class BaseTerminalController: NSWindowController,
         // Move focus to the target surface and activate the window/app
         DispatchQueue.main.async {
             Ghostty.moveFocus(to: view)
+            if self.ghostty.config.attentionClearOnFocus {
+                // Programmatic focus changes (goto-attention / auto-focus) should
+                // clear stale attention marks just like direct focus interactions.
+                view.clearAttention(reason: "programmaticFocus")
+            }
             view.window?.makeKeyAndOrderFront(nil)
             if !NSApp.isActive {
                 NSApp.activate(ignoringOtherApps: true)
@@ -379,6 +452,8 @@ class BaseTerminalController: NSWindowController,
         if (to.isEmpty) {
             focusedSurface = nil
         }
+
+        rebindSurfaceBellObservers()
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
@@ -393,6 +468,28 @@ class BaseTerminalController: NSWindowController,
                 surfaceView == focusedSurface!
             surfaceView.focusDidChange(focused)
         }
+    }
+
+    private func rebindSurfaceBellObservers() {
+        surfaceBellCancellables.removeAll()
+
+        for surface in surfaceTree {
+            surface.$bell
+                .removeDuplicates()
+                .sink { [weak self] _ in
+                    self?.syncAttentionTabHighlight()
+                }
+                .store(in: &surfaceBellCancellables)
+        }
+
+        syncAttentionTabHighlight()
+    }
+
+    private func syncAttentionTabHighlight() {
+        guard let terminalWindow = window as? TerminalWindow else { return }
+
+        let hasPendingAttention = !attentionSurfaces(in: self, applyWatchFilter: true).isEmpty
+        terminalWindow.setTransientTabColor(hasPendingAttention ? .yellow : nil)
     }
 
     // Call this whenever the frame changes
@@ -471,6 +568,550 @@ class BaseTerminalController: NSWindowController,
                 self.titleOverride = newTitle
             }
         }
+    }
+
+    struct QuickSurfaceAgentProvider {
+        let token: String
+        let displayName: String
+    }
+
+    static let quickSurfaceAgentProviders: [QuickSurfaceAgentProvider] = [
+        .init(token: "codex", displayName: "Codex"),
+        .init(token: "opencode", displayName: "OpenCode"),
+        .init(token: "ag-tui", displayName: "AG-TUI"),
+        .init(token: "claude", displayName: "Claude"),
+        .init(token: "vibe", displayName: "Vibe"),
+        .init(token: "gemini", displayName: "Gemini"),
+    ]
+
+    func markSurfaceAgent(_ name: String, surface: Ghostty.SurfaceView? = nil) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let target = surface ?? focusedSurface
+        target?.setAttentionAgentTag(
+            name: trimmed,
+            prefix: ghostty.config.attentionSurfaceTagPrefix,
+            suffix: ghostty.config.attentionSurfaceTagSuffix
+        )
+    }
+
+    func promptSurfaceAgentMark(_ surface: Ghostty.SurfaceView? = nil) {
+        guard let window else { return }
+        guard let target = surface ?? focusedSurface else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Mark Terminal as Agent"
+        alert.informativeText = "Enter a provider name such as codex or opencode."
+        alert.alertStyle = .informational
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 250, height: 24))
+        textField.stringValue = "codex"
+        alert.accessoryView = textField
+
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = textField
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .alertFirstButtonReturn else { return }
+
+            let name = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.markSurfaceAgent(name, surface: target)
+        }
+    }
+
+    func clearSurfaceAgentMark(_ surface: Ghostty.SurfaceView? = nil) {
+        let target = surface ?? focusedSurface
+        target?.clearAttentionAgentTag(
+            prefix: ghostty.config.attentionSurfaceTagPrefix,
+            suffix: ghostty.config.attentionSurfaceTagSuffix
+        )
+    }
+
+    func exportAgentAutodetectionDebugLog(_ surface: Ghostty.SurfaceView? = nil) {
+        guard window != nil else { return }
+        guard let target = surface ?? focusedSurface else { return }
+
+        let targetSurfaceId = target.id
+
+        // If a focused trace is already running, export immediately.
+        if focusedAgentTraceEnabled {
+            finalizeFocusedAgentTrace(reason: "export-debug")
+            if let resolvedTarget = resolveSurfaceForAgentDebugExport(preferredSurfaceId: targetSurfaceId) {
+                exportAgentAutodetectionDebugLogToSavePanel(targetSurface: resolvedTarget)
+            }
+            return
+        }
+
+        // Otherwise, auto-capture a short trace window before exporting.
+        startFocusedAgentAutodetectionTrace()
+
+        agentDebugLogAutoExportWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.agentDebugLogAutoExportWorkItem = nil
+
+            if self.focusedAgentTraceEnabled {
+                self.finalizeFocusedAgentTrace(reason: "export-debug-auto")
+            }
+            guard let resolvedTarget = self.resolveSurfaceForAgentDebugExport(preferredSurfaceId: targetSurfaceId) else {
+                return
+            }
+            self.exportAgentAutodetectionDebugLogToSavePanel(targetSurface: resolvedTarget)
+        }
+
+        agentDebugLogAutoExportWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + focusedAgentTraceAutoCaptureSeconds, execute: work)
+    }
+
+
+    private func resolveSurfaceForAgentDebugExport(preferredSurfaceId: UUID) -> Ghostty.SurfaceView? {
+        if let window {
+            let controllers: [BaseTerminalController] = (window.tabGroup?.windows ?? [window])
+                .compactMap { $0.windowController as? BaseTerminalController }
+            let surfaces: [Ghostty.SurfaceView] = controllers.flatMap { $0.surfaceTree.map { $0 } }
+            if let match = surfaces.first(where: { $0.id == preferredSurfaceId }) {
+                return match
+            }
+        }
+
+        return windowFirstResponderSurfaceView() ?? focusedSurface
+    }
+
+    private func agentBadgeSummary(for surface: Ghostty.SurfaceView?) -> String {
+        guard let surface else { return "none" }
+
+        let provider = surface.attentionAgentBadgeProvider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !provider.isEmpty else { return "none" }
+
+        let sourceSuffix: String = {
+            switch surface.attentionAgentBadgeSource {
+            case .marked: return "M"
+            case .detected: return "A"
+            case .diagnostic: return "D"
+            case .none: return ""
+            }
+        }()
+
+        if sourceSuffix.isEmpty { return provider }
+        return "\(provider) \(sourceSuffix)"
+    }
+
+    private func copyExportPathToClipboardAndNotify(url: URL, surface: Ghostty.SurfaceView?, kind: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+
+        let badgeSummary = agentBadgeSummary(for: surface)
+        let message = "\(kind) exported. Path copied to clipboard. current surface area showing badge '\(badgeSummary)'"
+        Ghostty.logger.info("\(message, privacy: .public)")
+
+        if ghostty.config.desktopNotifications, let surface {
+            surface.showUserNotification(title: "Ghostty Export", body: message)
+        }
+    }
+    private func exportAgentAutodetectionDebugLogToSavePanel(targetSurface: Ghostty.SurfaceView) {
+        guard let window else { return }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Agent Detection Snapshot"
+        panel.message = "Exports a one-shot snapshot of title, visible terminal text, and heuristic inputs."
+        panel.nameFieldStringValue = "ghostty-agent-detection-\(debugLogTimestamp()).log"
+        panel.canCreateDirectories = true
+        panel.allowedFileTypes = ["log", "txt"]
+        panel.isExtensionHidden = false
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let url = panel.url else { return }
+
+            do {
+                let payload = self.buildAgentAutodetectionDebugLog(targetSurface: targetSurface)
+                try payload.write(to: url, atomically: true, encoding: .utf8)
+                Ghostty.logger.info("exported agent detection debug log to \(url.path, privacy: .public)")
+                self.copyExportPathToClipboardAndNotify(url: url, surface: targetSurface, kind: "Agent detection snapshot")
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Failed to Export Detection Log"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    func startFocusedAgentAutodetectionTrace() {
+        guard !focusedAgentTraceEnabled else { return }
+
+        focusedAgentTraceAutoExportWorkItem?.cancel()
+        focusedAgentTraceAutoExportWorkItem = nil
+        agentDebugLogAutoExportWorkItem?.cancel()
+        agentDebugLogAutoExportWorkItem = nil
+
+        focusedAgentTraceEnabled = true
+        focusedAgentTraceStartedAt = Date()
+        focusedAgentTracePollIndex = 0
+        focusedAgentTraceLines.removeAll(keepingCapacity: true)
+        focusedAgentTraceLastViewportHash = nil
+        focusedAgentTraceLastSurfaceId = nil
+
+        appendFocusedAgentTraceHeader()
+        syncAgentStatusDetection()
+        captureFocusedAgentTracePoll(reason: "start")
+    }
+
+    func stopFocusedAgentAutodetectionTrace() {
+        finalizeFocusedAgentTrace(reason: "stop")
+    }
+
+    func exportFocusedAgentAutodetectionTraceAndStop() {
+        guard window != nil else { return }
+
+        // If a focused trace is already running, export immediately.
+        if focusedAgentTraceEnabled {
+            finalizeFocusedAgentTrace(reason: "export")
+            exportFocusedAgentAutodetectionTraceToSavePanel()
+            return
+        }
+
+        // Otherwise, auto-capture a short trace window before exporting.
+        startFocusedAgentAutodetectionTrace()
+
+        focusedAgentTraceAutoExportWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.focusedAgentTraceAutoExportWorkItem = nil
+
+            if self.focusedAgentTraceEnabled {
+                self.finalizeFocusedAgentTrace(reason: "export-auto")
+            }
+            self.exportFocusedAgentAutodetectionTraceToSavePanel()
+        }
+
+        focusedAgentTraceAutoExportWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + focusedAgentTraceAutoCaptureSeconds, execute: work)
+    }
+
+    private func exportFocusedAgentAutodetectionTraceToSavePanel() {
+        guard let window else { return }
+
+        guard !focusedAgentTraceLines.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No Agent Trace Data"
+            alert.informativeText = "Start a focused detection trace first, then export it."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: window, completionHandler: nil)
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Focused Agent Detection Poll Trace"
+        panel.message = "Exports per-poll autodetection diagnostics for the active surface only."
+        panel.nameFieldStringValue = "ghostty-agent-focused-trace-\(debugLogTimestamp()).log"
+        panel.canCreateDirectories = true
+        panel.allowedFileTypes = ["log", "txt"]
+        panel.isExtensionHidden = false
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let url = panel.url else { return }
+
+            do {
+                let payload = self.focusedAgentTraceLines.joined(separator: "\n")
+                try payload.write(to: url, atomically: true, encoding: .utf8)
+                Ghostty.logger.info("exported focused agent trace to \(url.path, privacy: .public)")
+                let target = self.windowFirstResponderSurfaceView() ?? self.focusedSurface
+                self.copyExportPathToClipboardAndNotify(url: url, surface: target, kind: "Focused agent poll trace")
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Failed to Export Focused Trace"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    private func captureFocusedAgentTracePollIfActive(
+        reason: String,
+        surfaces: [Ghostty.SurfaceView]? = nil
+    ) {
+        guard focusedAgentTraceEnabled else { return }
+        captureFocusedAgentTracePoll(reason: reason, surfaces: surfaces)
+    }
+
+    private func finalizeFocusedAgentTrace(reason: String) {
+        focusedAgentTraceAutoExportWorkItem?.cancel()
+        focusedAgentTraceAutoExportWorkItem = nil
+        agentDebugLogAutoExportWorkItem?.cancel()
+        agentDebugLogAutoExportWorkItem = nil
+
+        let wasActive = focusedAgentTraceEnabled
+        focusedAgentTraceEnabled = false
+
+        if wasActive {
+            captureFocusedAgentTracePoll(reason: reason)
+        }
+
+        guard !focusedAgentTraceLines.isEmpty else { return }
+
+        if focusedAgentTraceLines.last?.hasPrefix("# End focused trace") != true {
+            appendFocusedAgentTraceFooter(reason: reason)
+        }
+
+        syncAgentStatusDetection()
+    }
+
+    private func appendFocusedAgentTraceHeader() {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        focusedAgentTraceLines.append("# Ghostty Focused Agent Detection Trace")
+        focusedAgentTraceLines.append("started_at=\(iso.string(from: Date()))")
+        focusedAgentTraceLines.append("auto_focus_attention_watch_mode=\(ghostty.config.autoFocusAttentionWatchMode.rawValue)")
+        focusedAgentTraceLines.append("attention_autodetect_diagnostics=\(ghostty.config.attentionAutodetectDiagnostics.rawValue)")
+        focusedAgentTraceLines.append("attention_watch_providers=\(ghostty.config.attentionWatchProviders)")
+        focusedAgentTraceLines.append("attention_surface_tag_providers=\(ghostty.config.attentionSurfaceTagProviders)")
+        focusedAgentTraceLines.append("attention_provider_lock=\(ghostty.config.attentionProviderLock)")
+        focusedAgentTraceLines.append("attention_surface_tag_prefix=\(ghostty.config.attentionSurfaceTagPrefix)")
+        focusedAgentTraceLines.append("attention_surface_tag_suffix=\(ghostty.config.attentionSurfaceTagSuffix)")
+        focusedAgentTraceLines.append("attention_surface_tag_allow_any=\(ghostty.config.attentionSurfaceTagAllowAny)")
+        focusedAgentTraceLines.append("")
+    }
+
+    private func appendFocusedAgentTraceFooter(reason: String) {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        focusedAgentTraceLines.append("# End focused trace")
+        focusedAgentTraceLines.append("ended_at=\(iso.string(from: Date()))")
+        focusedAgentTraceLines.append("end_reason=\(reason)")
+    }
+
+    private func captureFocusedAgentTracePoll(
+        reason: String,
+        surfaces: [Ghostty.SurfaceView]? = nil
+    ) {
+        focusedAgentTracePollIndex &+= 1
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        focusedAgentTraceLines.append("[poll.\(focusedAgentTracePollIndex)]")
+        focusedAgentTraceLines.append("timestamp=\(iso.string(from: Date()))")
+        focusedAgentTraceLines.append("reason=\(reason)")
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        focusedAgentTraceLines.append("uptime=\(nowUptime)")
+
+        if let started = focusedAgentTraceStartedAt {
+            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000.0)
+            focusedAgentTraceLines.append("elapsed_ms=\(elapsedMs)")
+        }
+
+        let activeSurface = windowFirstResponderSurfaceView() ?? focusedSurface
+        let surface = activeSurface ?? surfaces?.first(where: { $0.id == focusedSurface?.id }) ?? surfaces?.first
+
+        guard let surface else {
+            focusedAgentTraceLines.append("active_surface=<none>")
+            focusedAgentTraceLines.append("")
+            return
+        }
+
+        let title = surface.title
+        let explicitMark = extractAttentionAgentTag(title)
+        let viewportText = surface.cachedVisibleContents.get()
+        let titleProvider = detectAgentProviderFromTitle(title)
+        let viewportProvider = detectAgentProviderFromViewport(viewportText)
+        let viewportHash = viewportText.hashValue
+        let viewportChanged = (focusedAgentTraceLastViewportHash != viewportHash) || (focusedAgentTraceLastSurfaceId != surface.id)
+
+        focusedAgentTraceLines.append("surface_id=\(surface.id.uuidString)")
+        focusedAgentTraceLines.append("surface_focused=\(focusedSurface?.id == surface.id)")
+        focusedAgentTraceLines.append("surface_bell=\(surface.bell)")
+        focusedAgentTraceLines.append("title=\(title.isEmpty ? "<empty>" : title)")
+        focusedAgentTraceLines.append("pwd=\(surface.pwd ?? "<nil>")")
+        focusedAgentTraceLines.append("explicit_mark=\(explicitMark ?? "<none>")")
+        focusedAgentTraceLines.append("watchable_under_current_mode=\(isAttentionSurfaceWatchable(surface))")
+        focusedAgentTraceLines.append("title_provider=\(titleProvider.rawValue)")
+        focusedAgentTraceLines.append("viewport_provider=\(viewportProvider.rawValue)")
+
+        if let stable = agentStable[surface.id] {
+            focusedAgentTraceLines.append("stable.provider=\(stable.provider.rawValue)")
+            focusedAgentTraceLines.append("stable.status=\(stable.status.rawValue)")
+            focusedAgentTraceLines.append("stable.badge_provider=\(stable.badgeProvider ?? "<none>")")
+            focusedAgentTraceLines.append("stable.source=\(stable.source.rawValue)")
+        } else {
+            focusedAgentTraceLines.append("stable=<none>")
+        }
+
+        if let observed = agentObserved[surface.id] {
+            focusedAgentTraceLines.append("observed.provider=\(observed.provider.rawValue)")
+            focusedAgentTraceLines.append("observed.status=\(observed.status.rawValue)")
+            focusedAgentTraceLines.append("observed.badge_provider=\(observed.badgeProvider ?? "<none>")")
+            focusedAgentTraceLines.append("observed.source=\(observed.source.rawValue)")
+            focusedAgentTraceLines.append("observed.since_uptime=\(observed.sinceUptime)")
+        } else {
+            focusedAgentTraceLines.append("observed=<none>")
+        }
+
+        if let lock = agentProviderLocks[surface.id] {
+            focusedAgentTraceLines.append("lock.provider=\(lock.provider.rawValue)")
+            focusedAgentTraceLines.append("lock.mismatch_provider=\(lock.mismatchProvider.rawValue)")
+            focusedAgentTraceLines.append("lock.mismatch_count=\(lock.mismatchCount)")
+            focusedAgentTraceLines.append("lock.unknown_idle_prompt_count=\(lock.unknownIdlePromptCount)")
+            focusedAgentTraceLines.append("lock.unknown_streak_count=\(lock.unknownStreakCount)")
+            let lockAgeMs = Int(max(0, (nowUptime - lock.lastPositiveEvidenceUptime) * 1000.0))
+            focusedAgentTraceLines.append("lock.last_positive_age_ms=\(lockAgeMs)")
+        } else {
+            focusedAgentTraceLines.append("lock=<none>")
+        }
+
+        focusedAgentTraceLines.append("viewport_hash=\(viewportHash)")
+        focusedAgentTraceLines.append("viewport_changed=\(viewportChanged)")
+
+        if viewportChanged {
+            let tail = lastLines(nonEmptyLines(viewportText), count: 40)
+            focusedAgentTraceLines.append("viewport_tail_begin")
+            focusedAgentTraceLines.append(tail)
+            focusedAgentTraceLines.append("viewport_tail_end")
+        }
+
+        focusedAgentTraceLines.append("")
+
+        focusedAgentTraceLastViewportHash = viewportHash
+        focusedAgentTraceLastSurfaceId = surface.id
+    }
+
+    private func debugLogTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    private func buildAgentAutodetectionDebugLog(targetSurface: Ghostty.SurfaceView) -> String {
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        let currentWindow = window
+        let tabWindows: [NSWindow] = if let currentWindow {
+            currentWindow.tabGroup?.windows ?? [currentWindow]
+        } else {
+            []
+        }
+        let controllers: [BaseTerminalController] = tabWindows.compactMap { $0.windowController as? BaseTerminalController }
+        let surfaces: [Ghostty.SurfaceView] = controllers.flatMap { $0.surfaceTree.map { $0 } }
+
+        let focusedId = focusedSurface?.id
+        let watchedRaw = ghostty.config.attentionWatchProviders
+        let watchedCanonical = watchedProviders().sorted().joined(separator: ",")
+        let tagProvidersRaw = ghostty.config.attentionSurfaceTagProviders
+        let tagProvidersCanonical = parseProviderSet(tagProvidersRaw).sorted().joined(separator: ",")
+        let tagProvidersEffectiveCanonical = surfaceTagProviders().sorted().joined(separator: ",")
+        let diagnosticsMode = ghostty.config.attentionAutodetectDiagnostics
+        let autoDetectionEnabled = agentAutodetectionEnabled()
+
+        var lines: [String] = []
+        lines.reserveCapacity(200)
+
+        lines.append("# Ghostty Agent Autodetection Debug Snapshot")
+        lines.append("generated_at=\(isoFormatter.string(from: Date()))")
+        lines.append("target_surface_id=\(targetSurface.id.uuidString)")
+        lines.append("")
+
+        lines.append("[config]")
+        lines.append("auto_focus_attention_watch_mode=\(ghostty.config.autoFocusAttentionWatchMode.rawValue)")
+        lines.append("attention_watch_providers_raw=\(watchedRaw)")
+        lines.append("attention_watch_providers_canonical=\(watchedCanonical)")
+        lines.append("attention_provider_lock=\(ghostty.config.attentionProviderLock)")
+        lines.append("attention_surface_tag_prefix=\(ghostty.config.attentionSurfaceTagPrefix)")
+        lines.append("attention_surface_tag_suffix=\(ghostty.config.attentionSurfaceTagSuffix)")
+        lines.append("attention_surface_tag_allow_any=\(ghostty.config.attentionSurfaceTagAllowAny)")
+        lines.append("attention_surface_tag_providers_raw=\(tagProvidersRaw)")
+        lines.append("attention_surface_tag_providers_canonical=\(tagProvidersCanonical)")
+        lines.append("attention_surface_tag_providers_effective_canonical=\(tagProvidersEffectiveCanonical)")
+        lines.append("attention_debug=\(ghostty.config.attentionDebug)")
+        lines.append("agent_status_stable_ms=\(ghostty.config.agentStatusStable)")
+        lines.append("attention_autodetect_diagnostics=\(diagnosticsMode.rawValue)")
+        lines.append("auto_detection_enabled=\(autoDetectionEnabled)")
+        lines.append("")
+
+        lines.append("[tab-group]")
+        lines.append("window_count=\(tabWindows.count)")
+        lines.append("surface_count=\(surfaces.count)")
+        lines.append("")
+
+        for (index, surface) in surfaces.enumerated() {
+            let title = surface.title
+            let explicitMark = extractAttentionAgentTag(title)
+            let titleProvider = autoDetectionEnabled ? detectAgentProviderFromTitle(title) : .unknown
+            let viewportText = surface.cachedVisibleContents.get()
+            let viewportProvider = autoDetectionEnabled ? detectAgentProviderFromViewport(viewportText) : .unknown
+            let isTarget = surface.id == targetSurface.id
+            let isFocused = surface.id == focusedId
+
+            lines.append("[surface.\(index + 1)]")
+            lines.append("id=\(surface.id.uuidString)")
+            lines.append("target=\(isTarget)")
+            lines.append("focused=\(isFocused)")
+            lines.append("bell=\(surface.bell)")
+            lines.append("title=\(title.isEmpty ? "<empty>" : title)")
+            lines.append("pwd=\(surface.pwd ?? "<nil>")")
+            lines.append("explicit_mark=\(explicitMark ?? "<none>")")
+            lines.append("title_provider=\(titleProvider.rawValue)")
+            lines.append("viewport_provider=\(viewportProvider.rawValue)")
+            lines.append("watchable_under_current_mode=\(isAttentionSurfaceWatchable(surface))")
+
+            if let stable = agentStable[surface.id] {
+                lines.append("stable.provider=\(stable.provider.rawValue)")
+                lines.append("stable.status=\(stable.status.rawValue)")
+                lines.append("stable.badge_provider=\(stable.badgeProvider ?? "<none>")")
+                lines.append("stable.source=\(stable.source.rawValue)")
+            } else {
+                lines.append("stable=<none>")
+            }
+
+            if let observed = agentObserved[surface.id] {
+                lines.append("observed.provider=\(observed.provider.rawValue)")
+                lines.append("observed.status=\(observed.status.rawValue)")
+                lines.append("observed.badge_provider=\(observed.badgeProvider ?? "<none>")")
+                lines.append("observed.source=\(observed.source.rawValue)")
+                lines.append("observed.since_uptime=\(observed.sinceUptime)")
+            } else {
+                lines.append("observed=<none>")
+            }
+
+            if let lock = agentProviderLocks[surface.id] {
+                lines.append("lock.provider=\(lock.provider.rawValue)")
+                lines.append("lock.mismatch_provider=\(lock.mismatchProvider.rawValue)")
+                lines.append("lock.mismatch_count=\(lock.mismatchCount)")
+                lines.append("lock.unknown_idle_prompt_count=\(lock.unknownIdlePromptCount)")
+                lines.append("lock.unknown_streak_count=\(lock.unknownStreakCount)")
+                let lockAgeMs = Int(max(0, (ProcessInfo.processInfo.systemUptime - lock.lastPositiveEvidenceUptime) * 1000.0))
+                lines.append("lock.last_positive_age_ms=\(lockAgeMs)")
+            } else {
+                lines.append("lock=<none>")
+            }
+
+            for provider in AgentProvider.allCases where provider != .unknown {
+                let status = detectAgentStatus(provider: provider, viewportText: viewportText)
+                lines.append("heuristic.status.\(provider.rawValue)=\(status.rawValue)")
+            }
+
+            lines.append("viewport_text_begin")
+            lines.append(viewportText)
+            lines.append("viewport_text_end")
+            lines.append("")
+        }
+
+        lines.append("# End of snapshot")
+        return lines.joined(separator: "\n")
     }
 
     /// Close a surface from a view.
@@ -656,8 +1297,9 @@ class BaseTerminalController: NSWindowController,
         // Update our derived config
         self.derivedConfig = DerivedConfig(config)
 
-        // Start/stop agent status detection overlay based on debug config.
+        // Start/stop agent detection based on debug/watch-mode config.
         syncAgentStatusDetection()
+        syncAttentionTabHighlight()
     }
 
     @objc private func ghosttyCommandPaletteDidToggle(_ notification: Notification) {
@@ -846,6 +1488,15 @@ class BaseTerminalController: NSWindowController,
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard let targetWindow = target.window else { return }
 
+        // Respect watch-mode filtering before we enqueue any auto-focus work.
+        guard isAttentionSurfaceWatchable(target) else {
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing ignored reason=watchFilter surface=\(target.id.uuidString)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            return
+        }
+
         // "Current window only": keep this within the current window's tab group.
         if let myGroup = window?.tabGroup, let targetGroup = targetWindow.tabGroup {
             guard myGroup === targetGroup else {
@@ -948,6 +1599,7 @@ class BaseTerminalController: NSWindowController,
                 if autoFocusAttentionPausedSurfaceId == nil {
                     autoFocusAttentionPausedSurfaceId = windowFirstResponderSurfaceView()?.id
                 }
+                armAutoFocusAttentionResumeOnFocusedIdle(reason: "focusedIdle")
                 setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
                 if ghostty.config.attentionDebug {
                     let msg = "attention autofocusing suppressed reason=surfaceFocused+mouseInside"
@@ -969,6 +1621,7 @@ class BaseTerminalController: NSWindowController,
             if autoFocusAttentionPausedSurfaceId == nil {
                 autoFocusAttentionPausedSurfaceId = windowFirstResponderSurfaceView()?.id
             }
+            armAutoFocusAttentionResumeOnFocusedIdle(reason: "focusedIdle")
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
             if ghostty.config.attentionDebug {
                 let msg = "attention autofocusing suppressed reason=surfaceFocused+mouseInside"
@@ -989,7 +1642,8 @@ class BaseTerminalController: NSWindowController,
         autoFocusAttentionWorkItem = work
 
         let idleMs = ghostty.config.autoFocusAttentionIdle
-        setAttentionOverlay("idleWait \(idleMs)ms")
+        let idleDeadline = ProcessInfo.processInfo.systemUptime + (Double(idleMs) / 1000.0)
+        setAttentionOverlay("idleWait", deadlineUptime: idleDeadline, reason: "initial-idle-gate")
         DispatchQueue.main.asyncAfter(
             deadline: .now() + .milliseconds(Int(idleMs)),
             execute: work
@@ -1024,7 +1678,10 @@ class BaseTerminalController: NSWindowController,
                     self?.attemptAutoFocusAttention(token: token, bypassIdle: bypassIdle, bypassFocusPause: bypassFocusPause)
                 }
                 autoFocusAttentionWorkItem = work
-                setAttentionOverlay("minAgeWait \(Int(minAgeMs))ms")
+                setAttentionOverlay(
+                    "minAgeWait",
+                    deadlineUptime: ProcessInfo.processInfo.systemUptime + (remainingMs / 1000.0),
+                    reason: "min-age")
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(remainingMs)), execute: work)
                 return
             }
@@ -1041,6 +1698,10 @@ class BaseTerminalController: NSWindowController,
                 }
                 let remainingMs = max(0.0, idleMs - elapsedMs)
                 autoFocusAttentionWorkItem?.cancel()
+                setAttentionOverlay(
+                    "idleWait",
+                    deadlineUptime: ProcessInfo.processInfo.systemUptime + (remainingMs / 1000.0),
+                    reason: "idle-recheck")
                 let work = DispatchWorkItem { [weak self] in
                     self?.attemptAutoFocusAttention(token: token, bypassIdle: false, bypassFocusPause: false)
                 }
@@ -1086,14 +1747,14 @@ class BaseTerminalController: NSWindowController,
 
         let candidates: [Ghostty.SurfaceView]
         if preferCurrentTab {
-            let local = attentionSurfaces(in: self)
+            let local = attentionSurfaces(in: self, applyWatchFilter: true)
             if !local.isEmpty {
                 candidates = sortAttentionSurfaces(local)
             } else {
-                candidates = sortAttentionSurfaces(attentionSurfacesAcrossTabGroup())
+                candidates = sortAttentionSurfaces(attentionSurfacesAcrossTabGroup(applyWatchFilter: true))
             }
         } else {
-            candidates = sortAttentionSurfaces(attentionSurfacesAcrossTabGroup())
+            candidates = sortAttentionSurfaces(attentionSurfacesAcrossTabGroup(applyWatchFilter: true))
         }
 
         guard !candidates.isEmpty else {
@@ -1140,16 +1801,22 @@ class BaseTerminalController: NSWindowController,
         targetController.focusSurface(next)
     }
 
-    private func attentionSurfaces(in controller: BaseTerminalController) -> [Ghostty.SurfaceView] {
-        controller.surfaceTree.filter { $0.bell }
+    private func attentionSurfaces(
+        in controller: BaseTerminalController,
+        applyWatchFilter: Bool = false
+    ) -> [Ghostty.SurfaceView] {
+        if applyWatchFilter {
+            return controller.surfaceTree.filter { $0.bell && controller.isAttentionSurfaceWatchable($0) }
+        }
+        return controller.surfaceTree.filter { $0.bell }
     }
 
-    private func attentionSurfacesAcrossTabGroup() -> [Ghostty.SurfaceView] {
+    private func attentionSurfacesAcrossTabGroup(applyWatchFilter: Bool = false) -> [Ghostty.SurfaceView] {
         guard let window else { return [] }
         let windows: [NSWindow] = window.tabGroup?.windows ?? [window]
         return windows
             .compactMap { $0.windowController as? BaseTerminalController }
-            .flatMap { attentionSurfaces(in: $0) }
+            .flatMap { attentionSurfaces(in: $0, applyWatchFilter: applyWatchFilter) }
     }
 
     private func sortAttentionSurfaces(_ surfaces: [Ghostty.SurfaceView]) -> [Ghostty.SurfaceView] {
@@ -1163,7 +1830,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func mostRecentAttentionSurface(preferCurrentTab: Bool) -> (BaseTerminalController, Ghostty.SurfaceView)? {
-        guard let window else { return nil }
+        guard window != nil else { return nil }
 
         func pick(from surfaces: [Ghostty.SurfaceView]) -> (BaseTerminalController, Ghostty.SurfaceView)? {
             guard let best = sortAttentionSurfaces(surfaces).first else { return nil }
@@ -1174,13 +1841,132 @@ class BaseTerminalController: NSWindowController,
         }
 
         if preferCurrentTab {
-            if let local = pick(from: attentionSurfaces(in: self)) {
+            if let local = pick(from: attentionSurfaces(in: self, applyWatchFilter: true)) {
                 return local
             }
         }
 
         // For auto-focus we want the most recent across the entire tab group.
-        return pick(from: attentionSurfacesAcrossTabGroup())
+        return pick(from: attentionSurfacesAcrossTabGroup(applyWatchFilter: true))
+    }
+
+    private func isAttentionSurfaceWatchable(_ surface: Ghostty.SurfaceView) -> Bool {
+        switch ghostty.config.autoFocusAttentionWatchMode {
+        case .all:
+            return true
+        case .marked:
+            return hasWatchableExplicitAgentMark(surface.title)
+        case .agents:
+            return isDetectedWatchedProvider(surface)
+        case .agents_or_marked:
+            return hasWatchableExplicitAgentMark(surface.title) || isDetectedWatchedProvider(surface)
+        }
+    }
+
+    private func isDetectedWatchedProvider(_ surface: Ghostty.SurfaceView) -> Bool {
+        let watched = watchedProviders()
+        guard !watched.isEmpty else { return false }
+
+        // Prefer the debounced, poll-derived state used by badges/overlays.
+        if let stable = agentStable[surface.id],
+           stable.source != .none,
+           let badgeProvider = stable.badgeProvider
+        {
+            let token = canonicalAgentProviderToken(badgeProvider) ?? badgeProvider
+            return watched.contains(token)
+        }
+
+        let titleProvider = detectAgentProviderFromTitle(surface.title)
+        if titleProvider != .unknown {
+            return watched.contains(titleProvider.rawValue)
+        }
+
+        // Fall back to viewport content when title doesn't classify.
+        let viewportProvider = detectAgentProviderFromViewport(surface.cachedVisibleContents.get())
+        guard viewportProvider != .unknown else { return false }
+        return watched.contains(viewportProvider.rawValue)
+    }
+
+    private func hasWatchableExplicitAgentMark(_ title: String) -> Bool {
+        extractAttentionAgentTag(title) != nil
+    }
+
+    private func parseProviderSet(_ raw: String) -> Set<String> {
+        let pieces = raw
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+
+        var result: Set<String> = []
+        result.reserveCapacity(pieces.count)
+        for piece in pieces {
+            if let canonical = canonicalAgentProviderToken(piece) {
+                result.insert(canonical)
+            } else {
+                result.insert(piece)
+            }
+        }
+
+        return result
+    }
+
+    private func watchedProviders() -> Set<String> {
+        parseProviderSet(ghostty.config.attentionWatchProviders)
+    }
+
+    private func surfaceTagProviders() -> Set<String> {
+        let explicit = parseProviderSet(ghostty.config.attentionSurfaceTagProviders)
+        if !explicit.isEmpty { return explicit }
+
+        // Backward-compatible fallback for existing configs.
+        return watchedProviders()
+    }
+
+    private func extractAttentionAgentTag(_ title: String) -> String? {
+        let prefix = ghostty.config.attentionSurfaceTagPrefix
+        let suffix = ghostty.config.attentionSurfaceTagSuffix
+        guard !prefix.isEmpty, !suffix.isEmpty else { return nil }
+
+        guard let prefixRange = title.range(of: prefix) else { return nil }
+        let rest = title[prefixRange.upperBound...]
+        guard let suffixRange = rest.range(of: suffix) else { return nil }
+
+        let token = rest[..<suffixRange.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !token.isEmpty else { return nil }
+
+        let normalized = canonicalAgentProviderToken(token) ?? token
+
+        if !ghostty.config.attentionSurfaceTagAllowAny {
+            let allowed = surfaceTagProviders()
+            guard allowed.contains(normalized) else { return nil }
+        }
+
+        return normalized
+    }
+
+    private func agentAutodetectionEnabled() -> Bool {
+        ghostty.config.autoFocusAttentionWatchMode != .marked ||
+            ghostty.config.attentionAutodetectDiagnostics != .off
+    }
+
+    private func diagnosticsAutodetectAllowed(
+        explicitMark: String?
+    ) -> Bool {
+        switch ghostty.config.attentionAutodetectDiagnostics {
+        case .off:
+            return false
+        case .marked:
+            return explicitMark != nil
+        case .all:
+            return true
+        }
+    }
+
+    private func diagnosticsBadgeEnabled() -> Bool {
+        ghostty.config.autoFocusAttentionWatchMode == .marked &&
+            ghostty.config.attentionAutodetectDiagnostics != .off
     }
 
     // MARK: Local Events
@@ -1307,7 +2093,7 @@ class BaseTerminalController: NSWindowController,
            let newSurface = windowFirstResponderSurfaceView() ?? to,
            newSurface.id != pausedId
         {
-            resumeAutoFocusAttention(reason: "surfaceSwitch", bypassFocusPause: true)
+            resumeAutoFocusAttention(reason: "surfaceSwitch", bypassFocusPause: false)
         }
 
         // Important to cancel any prior subscriptions
@@ -1375,6 +2161,7 @@ class BaseTerminalController: NSWindowController,
             } else {
                 setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
             }
+            armAutoFocusAttentionResumeOnFocusedIdle(reason: "focusedIdle")
             return
         }
 
@@ -1398,6 +2185,7 @@ class BaseTerminalController: NSWindowController,
             autoFocusAttentionWorkItem = nil
             autoFocusAttentionToken &+= 1
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
+            armAutoFocusAttentionResumeOnFocusedIdle(reason: "focusedIdle")
         } else {
             resumeAutoFocusAttention(reason: "mouseExit")
         }
@@ -1432,7 +2220,12 @@ class BaseTerminalController: NSWindowController,
         let token = autoFocusAttentionToken
 
         let delayMs = ghostty.config.autoFocusAttentionResumeDelay
-        setAttentionOverlay(delayMs == 0 ? "resume now (\(reason))" : "resume in \(delayMs)ms (\(reason))")
+        if delayMs == 0 {
+            setAttentionOverlay("resumeNow", reason: reason)
+        } else {
+            let resumeDeadline = ProcessInfo.processInfo.systemUptime + (Double(delayMs) / 1000.0)
+            setAttentionOverlay("resumeWait", deadlineUptime: resumeDeadline, reason: reason)
+        }
 
         let work = DispatchWorkItem { [weak self] in
             self?.attemptResumeAutoFocusAttention(token: token, reason: reason, delayMs: delayMs, bypassFocusPause: bypassFocusPause)
@@ -1469,6 +2262,10 @@ class BaseTerminalController: NSWindowController,
                 }
                 autoFocusAttentionWorkItem?.cancel()
                 autoFocusAttentionToken &+= 1
+                setAttentionOverlay(
+                    "resumeWait",
+                    deadlineUptime: ProcessInfo.processInfo.systemUptime + (Double(remainingMs) / 1000.0),
+                    reason: reason)
                 let newToken = autoFocusAttentionToken
                 let work = DispatchWorkItem { [weak self] in
                     self?.attemptResumeAutoFocusAttention(token: newToken, reason: reason, delayMs: delayMs, bypassFocusPause: bypassFocusPause)
@@ -1479,20 +2276,166 @@ class BaseTerminalController: NSWindowController,
             }
         }
 
-        attemptAutoFocusAttention(token: token, bypassIdle: true, bypassFocusPause: true)
+        attemptAutoFocusAttention(token: token, bypassIdle: true, bypassFocusPause: bypassFocusPause)
     }
 
-    private func setAttentionOverlay(_ text: String) {
+    private func armAutoFocusAttentionResumeOnFocusedIdle(reason: String) {
+        guard ghostty.config.autoFocusAttention else { return }
+        guard autoFocusAttentionPending else { return }
+
+        let focusedIdleMs = ghostty.config.autoFocusAttentionResumeOnFocusedIdle
+        guard focusedIdleMs > 0 else { return }
+
+        // If we're no longer in the paused-by-focus state, let normal scheduling
+        // logic handle auto-focus instead of forcing bypass behavior.
+        guard shouldPauseAutoFocusAttentionBecauseSurfaceFocused() else { return }
+
+        let elapsedMs = (ProcessInfo.processInfo.systemUptime - lastUserActivityUptime) * 1000.0
+        let remainingMs = max(0.0, Double(focusedIdleMs) - elapsedMs)
+        if remainingMs <= 0 {
+            resumeAutoFocusAttention(reason: reason, bypassFocusPause: true)
+            return
+        }
+
+        autoFocusAttentionWorkItem?.cancel()
+        autoFocusAttentionWorkItem = nil
+        autoFocusAttentionToken &+= 1
+        let token = autoFocusAttentionToken
+
+        setAttentionOverlay(
+            "focusedIdleWait",
+            deadlineUptime: ProcessInfo.processInfo.systemUptime + (remainingMs / 1000.0),
+            reason: reason)
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.attemptFocusedIdleResume(token: token, reason: reason, thresholdMs: focusedIdleMs)
+        }
+        autoFocusAttentionWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(remainingMs)), execute: work)
+    }
+
+    private func attemptFocusedIdleResume(token: UInt64, reason: String, thresholdMs: UInt) {
+        guard ghostty.config.autoFocusAttention else { return }
+        guard autoFocusAttentionPending else {
+            setAttentionOverlay("idle")
+            return
+        }
+        guard NSApp.isActive else { return }
+        guard window?.isKeyWindow ?? false else { return }
+        guard !commandPaletteIsShowing else { return }
+        guard token == autoFocusAttentionToken else { return }
+
+        // If we are no longer paused-by-focus, regular scheduling should decide.
+        guard shouldPauseAutoFocusAttentionBecauseSurfaceFocused() else {
+            scheduleAutoFocusAttention()
+            return
+        }
+
+        let elapsedMs = (ProcessInfo.processInfo.systemUptime - lastUserActivityUptime) * 1000.0
+        if elapsedMs < Double(thresholdMs) {
+            let remainingMs = UInt(max(0.0, Double(thresholdMs) - elapsedMs))
+            if ghostty.config.attentionDebug {
+                let msg = "attention autofocusing focusedIdleWait elapsedMs=\(Int(elapsedMs)) thresholdMs=\(thresholdMs) remainingMs=\(remainingMs) reason=\(reason)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+
+            autoFocusAttentionWorkItem?.cancel()
+            autoFocusAttentionToken &+= 1
+            let newToken = autoFocusAttentionToken
+            let work = DispatchWorkItem { [weak self] in
+                self?.attemptFocusedIdleResume(token: newToken, reason: reason, thresholdMs: thresholdMs)
+            }
+            autoFocusAttentionWorkItem = work
+            setAttentionOverlay(
+                "focusedIdleWait",
+                deadlineUptime: ProcessInfo.processInfo.systemUptime + (Double(remainingMs) / 1000.0),
+                reason: reason)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(remainingMs)), execute: work)
+            return
+        }
+
+        resumeAutoFocusAttention(reason: reason, bypassFocusPause: true)
+    }
+
+    private func tabGroupPositionLabel(for window: NSWindow?) -> String {
+        guard let window else { return "?" }
+        if let group = window.tabGroup,
+           let idx = group.windows.firstIndex(of: window)
+        {
+            return "\(idx + 1)/\(group.windows.count)"
+        }
+        return "1/1"
+    }
+
+    private func compactSurfaceTitleForOverlay(_ title: String) -> String {
+        let flattened = title
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !flattened.isEmpty else { return "<untitled>" }
+        if flattened.count <= 56 { return flattened }
+        let idx = flattened.index(flattened.startIndex, offsetBy: 56)
+        return String(flattened[..<idx]) + "…"
+    }
+
+    private func describePlannedAttentionTarget() -> String? {
+        guard let (_, surface) = mostRecentAttentionSurface(preferCurrentTab: true) else { return nil }
+
+        let tab = tabGroupPositionLabel(for: surface.window)
+        let sid = String(surface.id.uuidString.prefix(8))
+        let title = compactSurfaceTitleForOverlay(surface.title)
+        return "switch tab \(tab) surface \(sid) title=\"\(title)\""
+    }
+
+    private func refreshAttentionOverlay() {
         guard ghostty.config.attentionDebug else { return }
-        if attentionOverlayText == text { return }
-        attentionOverlayText = text
+
+        var pieces: [String] = []
+        pieces.append(attentionOverlayHint)
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if let deadline = attentionOverlayPlanDeadlineUptime {
+            let remainingMs = max(0, Int((deadline - now) * 1000.0))
+            pieces.append("t-\(remainingMs)ms")
+        }
+
+        if let reason = attentionOverlayPlanReason, !reason.isEmpty {
+            pieces.append("reason=\(reason)")
+        }
+
+        let idleMs = Int(max(0, (now - lastUserActivityUptime) * 1000.0))
+        pieces.append("idle=\(idleMs)ms")
+
+        let watchableMarks = attentionSurfacesAcrossTabGroup(applyWatchFilter: true).count
+        let totalMarks = attentionSurfacesAcrossTabGroup(applyWatchFilter: false).count
+        pieces.append("marks=\(watchableMarks)/\(totalMarks)")
+
+        if autoFocusAttentionPending {
+            pieces.append("pending=1")
+            pieces.append("next=\(describePlannedAttentionTarget() ?? "none")")
+        } else {
+            pieces.append("pending=0")
+        }
+
+        let text = pieces.joined(separator: " • ")
+        if attentionOverlayText != text {
+            attentionOverlayText = text
+        }
     }
 
-    // MARK: Agent Status Detection
+    private func setAttentionOverlay(_ text: String, deadlineUptime: TimeInterval? = nil, reason: String? = nil) {
+        guard ghostty.config.attentionDebug else { return }
+        attentionOverlayHint = text
+        attentionOverlayPlanDeadlineUptime = deadlineUptime
+        attentionOverlayPlanReason = reason
+        refreshAttentionOverlay()
+    }
+
+    // MARK: Agent Detection / Badges
 
     private func syncAgentStatusDetection() {
-        // Keep this debug-only so we don't introduce background work by default.
-        if ghostty.config.attentionDebug {
+        // We run polling when debug overlays are enabled OR when watch-mode
+        // filtering is active so per-surface agent badges stay up to date.
+        if ghostty.config.attentionDebug || ghostty.config.autoFocusAttentionWatchMode != .all || ghostty.config.attentionAutodetectDiagnostics != .off || focusedAgentTraceEnabled {
             startAgentStatusDetectionIfNeeded()
         } else {
             stopAgentStatusDetection()
@@ -1519,14 +2462,19 @@ class BaseTerminalController: NSWindowController,
         agentStatusTimer = nil
         agentObserved.removeAll()
         agentStable.removeAll()
+        agentProviderLocks.removeAll()
+        agentUnknownScanCursor = 0
+        for surface in surfaceTree.map({ $0 }) {
+            surface.clearAttentionAgentBadge()
+        }
         if !agentStatusOverlayText.isEmpty {
             agentStatusOverlayText = ""
         }
+        syncAttentionTabHighlight()
     }
 
-	    private func pollAgentStatuses() {
-	        guard ghostty.config.attentionDebug else { return }
-	        guard let window else { return }
+    private func pollAgentStatuses() {
+        guard let window else { return }
 
         // Collect all surfaces in the current tab group.
         let controllers: [BaseTerminalController] = (window.tabGroup?.windows ?? [window])
@@ -1534,81 +2482,266 @@ class BaseTerminalController: NSWindowController,
 
         let allSurfaces: [Ghostty.SurfaceView] = controllers.flatMap { $0.surfaceTree.map { $0 } }
         if allSurfaces.isEmpty {
+            captureFocusedAgentTracePollIfActive(reason: "autodetect-poll-empty")
             agentStatusOverlayText = ""
+            syncAttentionTabHighlight()
+            refreshAttentionOverlay()
             return
         }
+        let scanOrder: [Ghostty.SurfaceView] = {
+            let offset = allSurfaces.isEmpty ? 0 : (agentUnknownScanCursor % allSurfaces.count)
+            agentUnknownScanCursor = allSurfaces.isEmpty ? 0 : ((offset + 1) % allSurfaces.count)
+            if offset == 0 { return allSurfaces }
+            return Array(allSurfaces[offset...] + allSurfaces[..<offset])
+        }()
 
         let now = ProcessInfo.processInfo.systemUptime
         let stableMs = ghostty.config.agentStatusStable
         let stableWindow = Double(stableMs) / 1000.0
+        let debugOverlayEnabled = ghostty.config.attentionDebug
+        let markedOnlyMode = ghostty.config.autoFocusAttentionWatchMode == .marked
+        let providerLockEnabled = ghostty.config.attentionProviderLock
 
-        var nextStable: [UUID: (provider: AgentProvider, status: AgentStatus)] = agentStable
+        var nextStable = agentStable
         var nextObserved = agentObserved
+        var nextProviderLocks = agentProviderLocks
 
         // Prune removed surfaces.
         let ids = Set(allSurfaces.map { $0.id })
-	        nextStable = nextStable.filter { ids.contains($0.key) }
-	        nextObserved = nextObserved.filter { ids.contains($0.key) }
+        nextStable = nextStable.filter { ids.contains($0.key) }
+        nextObserved = nextObserved.filter { ids.contains($0.key) }
+        nextProviderLocks = nextProviderLocks.filter { ids.contains($0.key) }
 
-	        // To keep debug overhead bounded in large layouts, only scan a small number of
-	        // "unknown provider" panes per tick. Providers that are already known (from a
-	        // previous scan or from the title) are always updated.
-	        var unknownViewportScanBudget = 3
+        // To keep overhead bounded in large layouts, only scan a small number of
+        // unknown-provider panes per tick.
+        var unknownViewportScanBudget = 3
 
-	        for surface in allSurfaces {
-	            let titleProvider = detectAgentProviderFromTitle(surface.title)
-	            let rememberedProvider = nextStable[surface.id]?.provider ?? nextObserved[surface.id]?.provider ?? .unknown
-	            var provider: AgentProvider = titleProvider != .unknown ? titleProvider : rememberedProvider
+        for surface in scanOrder {
+            let explicitMark = extractAttentionAgentTag(surface.title)
+            let diagnosticsAllowedForSurface = diagnosticsAutodetectAllowed(explicitMark: explicitMark)
+            let allowAutodetectionForSurface = !markedOnlyMode || diagnosticsAllowedForSurface
+            let titleProvider: AgentProvider = allowAutodetectionForSurface ? detectAgentProviderFromTitle(surface.title) : .unknown
+            let remembered = nextStable[surface.id] ?? nextObserved[surface.id].map {
+                AgentStableState(
+                    provider: $0.provider,
+                    status: $0.status,
+                    badgeProvider: $0.badgeProvider,
+                    source: $0.source
+                )
+            }
 
-	            // Always read viewport for known providers (status changes), and for a small
-	            // rotating set of unknown providers (provider discovery).
-	            let shouldReadViewport: Bool = {
-	                if provider != .unknown { return true }
-	                if unknownViewportScanBudget <= 0 { return false }
-	                unknownViewportScanBudget -= 1
-	                return true
-	            }()
+            var provider: AgentProvider = titleProvider != .unknown ? titleProvider : .unknown
+            var status: AgentStatus = debugOverlayEnabled ? (remembered?.status ?? .idle) : .idle
 
-	            var status: AgentStatus = .idle
-	            if shouldReadViewport {
-	                let text = surface.cachedVisibleContents.get()
-	                if provider == .unknown {
-	                    provider = detectAgentProviderFromViewport(text)
-	                }
-	                if provider != .unknown {
-	                    status = detectAgentStatus(provider: provider, viewportText: text)
-	                }
-	            }
+            var source: AgentDetectionSource = .none
+            var badgeProvider: String? = nil
+            var explicitMarkedProvider: AgentProvider? = nil
+            if let explicitMark {
+                source = .marked
+                badgeProvider = explicitMark
+                if let canonical = canonicalAgentProviderToken(explicitMark),
+                   let markedProvider = AgentProvider(rawValue: canonical)
+                {
+                    provider = markedProvider
+                    explicitMarkedProvider = markedProvider
+                }
+            } else if titleProvider != .unknown {
+                source = .title
+                badgeProvider = titleProvider.rawValue
+            }
 
-	            if var obs = nextObserved[surface.id] {
-	                if obs.provider != provider || obs.status != status {
-	                    // New candidate; reset debounce.
-	                    obs.provider = provider
-	                    obs.status = status
-	                    obs.sinceUptime = now
-	                    nextObserved[surface.id] = obs
-	                } else {
-	                    // Candidate unchanged; promote to stable once it's held long enough.
-	                    if (now - obs.sinceUptime) >= stableWindow {
-	                        nextStable[surface.id] = (provider: provider, status: status)
-	                    }
-	                }
-	            } else {
-	                nextObserved[surface.id] = .init(provider: provider, status: status, sinceUptime: now)
-	                // Don't immediately promote; require stability window.
-	            }
-	        }
+            let currentLock = nextProviderLocks[surface.id]
+            var sampledViewportText: String? = nil
+
+            let shouldReadViewport: Bool = {
+                if !allowAutodetectionForSurface {
+                    // Autodetection disabled for this surface; only sample
+                    // explicitly marked panes when debug overlay needs status.
+                    return source == .marked && debugOverlayEnabled
+                }
+                if providerLockEnabled, currentLock != nil {
+                    return true
+                }
+                if source == .marked {
+                    // Explicit marks don't need viewport classification for eligibility,
+                    // but diagnostics mode may still sample viewport evidence.
+                    if markedOnlyMode && diagnosticsAllowedForSurface { return true }
+                    return debugOverlayEnabled
+                }
+                if source == .title {
+                    // Title-only detection is prone to staleness (apps can leave
+                    // provider-like titles behind after exit). Always validate
+                    // against current viewport content.
+                    return true
+                }
+                // Unknown title: sample a bounded rotating set each tick so
+                // badges and filtering converge without sticking to stale labels.
+                if unknownViewportScanBudget <= 0 { return false }
+                unknownViewportScanBudget -= 1
+                return true
+            }()
+
+            if shouldReadViewport {
+                let text = surface.cachedVisibleContents.get()
+                sampledViewportText = text
+                let preferredProvider = currentLock?.provider ?? remembered?.provider
+                let viewportProvider: AgentProvider = allowAutodetectionForSurface ? detectAgentProviderFromViewport(text, preferred: preferredProvider) : .unknown
+
+                if allowAutodetectionForSurface {
+                    if source == .none {
+                        if viewportProvider != .unknown {
+                            provider = viewportProvider
+                            source = .viewport
+                            badgeProvider = viewportProvider.rawValue
+                        }
+                    } else if source == .title {
+                        if viewportProvider == .unknown {
+                            if viewportLooksLikeReturnedShellPrompt(text) {
+                                // Demote stale title-only classifications when the
+                                // viewport has clearly returned to a regular shell prompt.
+                                provider = .unknown
+                                source = .none
+                                badgeProvider = nil
+                            } else {
+                                // Keep title-based classification while the viewport is
+                                // still in an active transcript (no shell prompt yet).
+                                provider = titleProvider
+                                source = .title
+                                badgeProvider = titleProvider.rawValue
+                            }
+                        } else if viewportProvider != titleProvider {
+                            let titleIsCodexOrOpenCode = titleProvider == .codex || titleProvider == .opencode
+                            let viewportIsCodexOrOpenCode = viewportProvider == .codex || viewportProvider == .opencode
+                            if !(titleIsCodexOrOpenCode && viewportIsCodexOrOpenCode) {
+                                // Prefer live viewport evidence if it disagrees with title,
+                                // except codex<->opencode where cross-mentions are common.
+                                provider = viewportProvider
+                                source = .viewport
+                                badgeProvider = viewportProvider.rawValue
+                            }
+                        }
+                    }
+
+                    // In marked watch-mode with diagnostics enabled, keep
+                    // autodetect results visible as diagnostic badges.
+                    if markedOnlyMode && diagnosticsAllowedForSurface && viewportProvider != .unknown {
+                        provider = viewportProvider
+                        source = .diagnostic
+                        badgeProvider = viewportProvider.rawValue
+                    }
+                }
+
+                if debugOverlayEnabled, provider != .unknown {
+                    status = detectAgentStatus(provider: provider, viewportText: text)
+                }
+            }
+
+            if providerLockEnabled {
+                let locked = applyAgentProviderLock(
+                    surfaceId: surface.id,
+                    explicitMarkedProvider: explicitMarkedProvider,
+                    allowAutodetectionForSurface: allowAutodetectionForSurface,
+                    detectedProvider: provider,
+                    detectedSource: source,
+                    detectedBadgeProvider: badgeProvider,
+                    viewportText: sampledViewportText,
+                    locks: &nextProviderLocks
+                )
+                provider = locked.provider
+                source = locked.source
+                badgeProvider = locked.badgeProvider
+            }
+
+            if debugOverlayEnabled, provider != .unknown, let text = sampledViewportText {
+                status = detectAgentStatus(provider: provider, viewportText: text)
+            }
+
+            if var obs = nextObserved[surface.id] {
+                if obs.provider != provider ||
+                    obs.status != status ||
+                    obs.badgeProvider != badgeProvider ||
+                    obs.source != source
+                {
+                    // New candidate; reset debounce.
+                    obs.provider = provider
+                    obs.status = status
+                    obs.badgeProvider = badgeProvider
+                    obs.source = source
+                    obs.sinceUptime = now
+                    nextObserved[surface.id] = obs
+                } else if (now - obs.sinceUptime) >= stableWindow {
+                    // Candidate unchanged; promote to stable once it's held long enough.
+                    nextStable[surface.id] = .init(
+                        provider: provider,
+                        status: status,
+                        badgeProvider: badgeProvider,
+                        source: source
+                    )
+                }
+            } else {
+                nextObserved[surface.id] = .init(
+                    provider: provider,
+                    status: status,
+                    badgeProvider: badgeProvider,
+                    source: source,
+                    sinceUptime: now
+                )
+                // Don't immediately promote; require stability window.
+            }
+        }
 
         agentObserved = nextObserved
         agentStable = nextStable
+        agentProviderLocks = nextProviderLocks
 
-        let overlay = renderAgentStatusOverlay(from: nextStable)
-        if agentStatusOverlayText != overlay {
-            agentStatusOverlayText = overlay
+        captureFocusedAgentTracePollIfActive(reason: "autodetect-poll", surfaces: allSurfaces)
+
+        applyAgentBadges(from: nextStable, to: allSurfaces)
+
+        if debugOverlayEnabled {
+            let overlay = renderAgentStatusOverlay(from: nextStable)
+            if agentStatusOverlayText != overlay {
+                agentStatusOverlayText = overlay
+            }
+        } else if !agentStatusOverlayText.isEmpty {
+            agentStatusOverlayText = ""
+        }
+
+        syncAttentionTabHighlight()
+        refreshAttentionOverlay()
+    }
+
+    private func applyAgentBadges(
+        from stable: [UUID: AgentStableState],
+        to surfaces: [Ghostty.SurfaceView]
+    ) {
+        for surface in surfaces {
+            guard let state = stable[surface.id],
+                  let provider = state.badgeProvider,
+                  !provider.isEmpty,
+                  state.source != .none
+            else {
+                surface.clearAttentionAgentBadge()
+                continue
+            }
+
+            let source: Ghostty.SurfaceView.AgentBadgeSource = {
+                switch state.source {
+                case .marked:
+                    return .marked
+                case .diagnostic:
+                    return .diagnostic
+                case .title, .viewport:
+                    return diagnosticsBadgeEnabled() ? .diagnostic : .detected
+                case .none:
+                    return .none
+                }
+            }()
+            surface.setAttentionAgentBadge(provider: provider, source: source)
         }
     }
 
-    private func renderAgentStatusOverlay(from stable: [UUID: (provider: AgentProvider, status: AgentStatus)]) -> String {
+    private func renderAgentStatusOverlay(from stable: [UUID: AgentStableState]) -> String {
         guard !stable.isEmpty else { return "" }
 
         // Counts per provider across the tab group.
@@ -1626,7 +2759,7 @@ class BaseTerminalController: NSWindowController,
         }
 
         // Stable ordering (most useful first).
-        let order: [AgentProvider] = [.codex, .opencode, .claude, .vibe, .gemini]
+        let order: [AgentProvider] = [.codex, .opencode, .ag_tui, .claude, .vibe, .gemini]
 
         // Emojis to keep it compact:
         // - waiting: ⏳
@@ -1640,42 +2773,365 @@ class BaseTerminalController: NSWindowController,
         return pieces.joined(separator: "  |  ")
     }
 
-	    private func detectAgentProviderFromTitle(_ title: String) -> AgentProvider {
-	        let t = title.lowercased()
-	        func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }
+    private func providerLockAllowsSource(_ source: AgentDetectionSource) -> Bool {
+        switch source {
+        case .title, .viewport, .diagnostic:
+            return true
+        case .none, .marked:
+            return false
+        }
+    }
+
+    private func viewportLooksLikeReturnedShellPrompt(_ viewportText: String) -> Bool {
+        guard let last = nonEmptyLines(viewportText).last else { return false }
+        return looksLikeShellPromptLine(last)
+    }
+
+    private func applyAgentProviderLock(
+        surfaceId: UUID,
+        explicitMarkedProvider: AgentProvider?,
+        allowAutodetectionForSurface: Bool,
+        detectedProvider: AgentProvider,
+        detectedSource: AgentDetectionSource,
+        detectedBadgeProvider: String?,
+        viewportText: String?,
+        locks: inout [UUID: AgentProviderLockState]
+    ) -> (provider: AgentProvider, source: AgentDetectionSource, badgeProvider: String?) {
+        // Explicit marks are authoritative and should not be rewritten by
+        // autodetection lock state.
+        if explicitMarkedProvider != nil {
+            locks[surfaceId] = nil
+            return (detectedProvider, detectedSource, detectedBadgeProvider)
+        }
+
+        // Locking only applies to autodetection-enabled surfaces.
+        guard allowAutodetectionForSurface else {
+            locks[surfaceId] = nil
+            return (detectedProvider, detectedSource, detectedBadgeProvider)
+        }
+
+        let lockableSource = providerLockAllowsSource(detectedSource)
+        let now = ProcessInfo.processInfo.systemUptime
+        var lockState = locks[surfaceId]
+
+        // Acquire lock only after at least one observed confirmation so a single
+        // noisy poll doesn't immediately stick a provider.
+        if lockState == nil, lockableSource, detectedProvider != .unknown {
+            if let observed = agentObserved[surfaceId],
+               observed.provider == detectedProvider,
+               observed.source == detectedSource
+            {
+                lockState = AgentProviderLockState(
+                    provider: detectedProvider,
+                    lastPositiveEvidenceUptime: now
+                )
+            } else {
+                return (detectedProvider, detectedSource, detectedBadgeProvider)
+            }
+        }
+
+        guard var lock = lockState else {
+            locks[surfaceId] = nil
+            return (detectedProvider, detectedSource, detectedBadgeProvider)
+        }
+
+        if lockableSource, detectedProvider != .unknown {
+            lock.lastPositiveEvidenceUptime = now
+            lock.unknownIdlePromptCount = 0
+            lock.unknownStreakCount = 0
+
+            if detectedProvider == lock.provider {
+                lock.mismatchProvider = .unknown
+                lock.mismatchCount = 0
+            } else {
+                if lock.mismatchProvider == detectedProvider {
+                    lock.mismatchCount += 1
+                } else {
+                    lock.mismatchProvider = detectedProvider
+                    lock.mismatchCount = 1
+                }
+
+                if lock.mismatchCount >= agentProviderLockSwitchPolls {
+                    lock.provider = detectedProvider
+                    lock.mismatchProvider = .unknown
+                    lock.mismatchCount = 0
+                }
+            }
+        } else {
+            lock.mismatchProvider = .unknown
+            lock.mismatchCount = 0
+
+            if detectedProvider == .unknown {
+                lock.unknownStreakCount += 1
+
+                if let viewportText {
+                    let lockedStatus = detectAgentStatus(provider: lock.provider, viewportText: viewportText)
+                    if lockedStatus == .idle && viewportLooksLikeReturnedShellPrompt(viewportText) {
+                        lock.unknownIdlePromptCount += 1
+                    } else {
+                        lock.unknownIdlePromptCount = 0
+                    }
+                } else {
+                    lock.unknownIdlePromptCount = 0
+                }
+            } else {
+                lock.unknownStreakCount = 0
+                lock.unknownIdlePromptCount = 0
+            }
+        }
+
+        if lock.unknownIdlePromptCount >= agentProviderLockPromptClearPolls ||
+            lock.unknownStreakCount >= agentProviderLockUnknownClearPolls
+        {
+            locks[surfaceId] = nil
+            return (detectedProvider, detectedSource, detectedBadgeProvider)
+        }
+
+        locks[surfaceId] = lock
+
+        let lockedSource: AgentDetectionSource = {
+            if detectedSource != .none {
+                return detectedSource
+            }
+            return viewportText == nil ? .title : .viewport
+        }()
+
+        return (lock.provider, lockedSource, lock.provider.rawValue)
+    }
+
+    private func canonicalAgentProviderToken(_ token: String) -> String? {
+
+        let t = token
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if t.contains("codex") || t.contains("openai codex") { return AgentProvider.codex.rawValue }
+        if t.contains("opencode") || t.contains("open code") { return AgentProvider.opencode.rawValue }
+        if t.contains("ag-tui") || t.contains("ag tui") || t.contains("antigod-tui") || t.contains("antigod tui") || t == "ag" { return AgentProvider.ag_tui.rawValue }
+        if t.contains("claude") { return AgentProvider.claude.rawValue }
+        if t.contains("vibe") { return AgentProvider.vibe.rawValue }
+        if t.contains("gemini") { return AgentProvider.gemini.rawValue }
+
+        return nil
+    }
+
+    private func detectAgentProviderFromTitle(_ title: String) -> AgentProvider {
+        if let marked = extractAttentionAgentTag(title),
+           let canonical = canonicalAgentProviderToken(marked),
+           let provider = AgentProvider(rawValue: canonical)
+        {
+            return provider
+        }
+
+        let t = title.lowercased()
+        let trimmedTitle = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }
 
         // Prefer explicit title matches since they are often set to the running tool command.
         if hasAny(t, ["codex"]) { return .codex }
         if hasAny(t, ["opencode", "open code"]) { return .opencode }
+        if trimmedTitle == "ag" || trimmedTitle == "antigod" || hasAny(t, ["ag-tui", "ag tui", "antigod-tui", "antigod tui", "antigod cli"]) { return .ag_tui }
         if hasAny(t, ["claude"]) { return .claude }
         if hasAny(t, ["vibe"]) { return .vibe }
         if hasAny(t, ["gemini"]) { return .gemini }
 
-	        return .unknown
-	    }
+        return .unknown
+    }
 
-	    private func detectAgentProviderFromViewport(_ viewportText: String) -> AgentProvider {
-	        let t = viewportText.lowercased()
-	        func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }
+    private func hasCodexViewportSignature(_ lower: String) -> Bool {
+        let markers = [
+            "openai codex (v",
+            " >_ openai codex",
+            "codex --model",
+            "codex --yolo",
+            "codex cli",
+            "codex>",
+            " /review",
+        ]
+        return markers.contains(where: lower.contains)
+    }
 
-	        // Keep this intentionally loose: we only use this when title is unknown and we want
-	        // a best-effort provider classification.
-	        if hasAny(t, ["codex", "openai codex"]) { return .codex }
-	        if hasAny(t, ["opencode", "open code"]) { return .opencode }
-	        if hasAny(t, ["claude"]) { return .claude }
-	        if hasAny(t, ["vibe"]) { return .vibe }
-	        if hasAny(t, ["gemini"]) { return .gemini }
+    private func hasOpenCodeViewportSignature(_ lower: String) -> Bool {
+        let markers = [
+            "opencode --",
+            "opencode/",
+            " opencode v",
+            "opencode cli",
+            "opencode",
+        ]
+        return markers.contains(where: lower.contains)
+    }
 
-	        return .unknown
-	    }
 
-	    private func detectAgentStatus(provider: AgentProvider, viewportText: String) -> AgentStatus {
-	        // Ported from agent-of-empires status detection (viewport-only).
-	        switch provider {
+    private func hasGeminiViewportSignature(_ lower: String) -> Bool {
+        let markers = [
+            "gemini cli",
+            "gemini-cli",
+            "google gemini",
+            "gemini --",
+            "gemini --model",
+            "gemini>",
+            " gemini v",
+            "gemini api key",
+            "gemini 2.5",
+            "gemini 2.0",
+        ]
+        return markers.contains(where: lower.contains)
+    }
+
+    private func geminiMentionsLookLikeDiscussionText(_ lower: String) -> Bool {
+        let lines = lower
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let mentionLines = lines.filter { $0.contains("gemini") }
+        guard !mentionLines.isEmpty else { return false }
+
+        if mentionLines.contains(where: hasGeminiViewportSignature) {
+            return false
+        }
+
+        let discussionHints = [
+            "not gemini",
+            "is not gemini",
+            "isn't gemini",
+            "how to use gemini",
+            "what is gemini",
+            "remote trace",
+            "attention-",
+            "auto-focus-",
+            "watch-providers",
+            "values:",
+            "example",
+            "[gemini]",
+            "provider",
+            "detection",
+        ]
+
+        return mentionLines.allSatisfy { line in
+            if line.hasPrefix("#") || line.hasPrefix("-") || line.hasPrefix("›") {
+                return true
+            }
+            return discussionHints.contains(where: line.contains)
+        }
+    }
+    private func opencodeMentionsLookLikeConfigText(_ lower: String) -> Bool {
+        let lines = lower
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let mentionLines = lines.filter { $0.contains("opencode") }
+        guard !mentionLines.isEmpty else { return false }
+
+        let promptHints = ["➜", "$ ", "% ", "❯", "›", "│ >_", "model:"]
+        if mentionLines.contains(where: { line in promptHints.contains(where: line.contains) }) {
+            return false
+        }
+
+        let configHints = [
+            "attention-",
+            "auto-focus-",
+            "notify-on-",
+            "watch-providers",
+            "surface-tag",
+            "keybind",
+            "values:",
+            "example",
+            "=",
+            "[opencode]",
+        ]
+
+        return mentionLines.allSatisfy { line in
+            if line.hasPrefix("#") { return true }
+            return configHints.contains(where: line.contains)
+        }
+    }
+
+    private func lastProviderMentionOffset(_ lower: String, needles: [String]) -> String.Index? {
+        var best: String.Index? = nil
+        for needle in needles {
+            if let range = lower.range(of: needle, options: .backwards) {
+                if let current = best {
+                    if range.lowerBound > current {
+                        best = range.lowerBound
+                    }
+                } else {
+                    best = range.lowerBound
+                }
+            }
+        }
+        return best
+    }
+
+    private func detectAgentProviderFromViewport(_ viewportText: String, preferred: AgentProvider? = nil) -> AgentProvider {
+        let tailLower = detectionTailLower(viewportText, lineCount: 36)
+        let fullLower = viewportText.lowercased()
+        func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }
+
+        // Prefer evidence near the active prompt/status area (tail). This reduces
+        // stale detections from older scrollback content.
+        let codexMentionedTail = hasAny(tailLower, ["codex", "openai codex"])
+        let opencodeMentionedTail = hasAny(tailLower, ["opencode"])
+        let geminiMentionedTail = hasAny(tailLower, ["gemini"])
+
+        var codexDetected = codexMentionedTail && hasCodexViewportSignature(tailLower)
+        var opencodeDetected = opencodeMentionedTail && hasOpenCodeViewportSignature(tailLower) && !opencodeMentionsLookLikeConfigText(tailLower)
+        var geminiDetected = geminiMentionedTail && hasGeminiViewportSignature(tailLower) && !geminiMentionsLookLikeDiscussionText(tailLower)
+        var providerScanLower = tailLower
+
+        // Fallback to full-viewport scan only if tail is inconclusive.
+        if !codexDetected && !opencodeDetected && !geminiDetected {
+            providerScanLower = fullLower
+            let codexMentioned = hasAny(fullLower, ["codex", "openai codex"])
+            let opencodeMentioned = hasAny(fullLower, ["opencode"])
+            let geminiMentioned = hasAny(fullLower, ["gemini"])
+
+            codexDetected = codexMentioned && hasCodexViewportSignature(fullLower)
+            opencodeDetected = opencodeMentioned && hasOpenCodeViewportSignature(fullLower) && !opencodeMentionsLookLikeConfigText(fullLower)
+            geminiDetected = geminiMentioned && hasGeminiViewportSignature(fullLower) && !geminiMentionsLookLikeDiscussionText(fullLower)
+        }
+
+        if codexDetected && opencodeDetected {
+            if let preferred, preferred == .opencode || preferred == .codex {
+                return preferred
+            }
+            let codexIdx = lastProviderMentionOffset(providerScanLower, needles: ["openai codex", "codex"])
+            let opencodeIdx = lastProviderMentionOffset(providerScanLower, needles: ["opencode"])
+            if let codexIdx, let opencodeIdx {
+                return opencodeIdx > codexIdx ? .opencode : .codex
+            }
+            return .opencode
+        }
+
+        if opencodeDetected { return .opencode }
+        if codexDetected { return .codex }
+        if hasAny(tailLower, ["ag-tui", "ag tui", "antigod-tui", "antigod tui", "antigod cli"]) {
+            return detectAgTuiStatus(viewportText) == .idle ? .unknown : .ag_tui
+        }
+        if hasAny(tailLower, ["claude"]) {
+            return detectClaudeStatus(viewportText) == .idle ? .unknown : .claude
+        }
+        if hasAny(tailLower, ["vibe"]) {
+            return detectVibeStatus(viewportText) == .idle ? .unknown : .vibe
+        }
+        if geminiDetected {
+            return detectGeminiStatus(viewportText) == .idle ? .unknown : .gemini
+        }
+
+        return .unknown
+    }
+
+    private func detectAgentStatus(provider: AgentProvider, viewportText: String) -> AgentStatus {
+        // Ported from agent-of-empires status detection (viewport-only).
+        switch provider {
         case .claude:
             return detectClaudeStatus(viewportText)
         case .opencode:
             return detectOpenCodeStatus(viewportText)
+        case .ag_tui:
+            return detectAgTuiStatus(viewportText)
         case .vibe:
             return detectVibeStatus(viewportText)
         case .codex:
@@ -1689,6 +3145,13 @@ class BaseTerminalController: NSWindowController,
     }
 
     private static let aoeSpinnerChars: [String] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    private func detectionTailLower(_ content: String, lineCount: Int) -> String {
+        let nonEmpty = nonEmptyLines(content)
+        let tail = lastLines(nonEmpty, count: lineCount)
+        return tail.lowercased()
+    }
+
 
     private func nonEmptyLines(_ content: String) -> [String] {
         content
@@ -1728,12 +3191,34 @@ class BaseTerminalController: NSWindowController,
         return out
     }
 
+    private func looksLikeShellPromptLine(_ line: String) -> Bool {
+        let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return false }
+
+        if clean.hasPrefix("➜ ") || clean.hasPrefix("$ ") || clean.hasPrefix("% ") || clean.hasPrefix("# ") {
+            return true
+        }
+        if clean.hasSuffix("$") || clean.hasSuffix("%") || clean.hasSuffix("#") {
+            return true
+        }
+
+        return false
+    }
+
     private func detectClaudeStatus(_ content: String) -> AgentStatus {
         let lines = content.split(whereSeparator: \.isNewline).map { String($0) }
         let nonEmpty = nonEmptyLines(content)
         let last = lastLines(nonEmpty, count: 30)
         let lastLower = last.lowercased()
 
+        if let lastLine = nonEmpty.last,
+           looksLikeShellPromptLine(lastLine),
+           !lastLower.contains("esc to interrupt"),
+           !lastLower.contains("ctrl+c to interrupt"),
+           !containsSpinner(content)
+        {
+            return .idle
+        }
         if lastLower.contains("esc to interrupt") || lastLower.contains("ctrl+c to interrupt") {
             return .running
         }
@@ -1873,6 +3358,54 @@ class BaseTerminalController: NSWindowController,
         let activity = ["running", "reading", "writing", "executing", "processing", "generating", "thinking"]
         for a in activity where recentLower.contains(a) { return .running }
         if recentText.hasSuffix("…") || recentText.hasSuffix("...") { return .running }
+
+        return .idle
+    }
+
+    private func detectAgTuiStatus(_ content: String) -> AgentStatus {
+        let nonEmpty = nonEmptyLines(content)
+        let last = lastLines(nonEmpty, count: 30)
+        let lastLower = last.lowercased()
+
+        if let lastLine = nonEmpty.last,
+           looksLikeShellPromptLine(lastLine),
+           !containsSpinner(content)
+        {
+            return .idle
+        }
+
+        if containsSpinner(content) { return .running }
+
+        let runningIndicators = [
+            "connecting",
+            "loading",
+            "starting",
+            "retrying",
+            "working",
+            "thinking",
+        ]
+        for p in runningIndicators where lastLower.contains(p) { return .running }
+
+        let waitingIndicators = [
+            "antigod-tui",
+            "type a message",
+            "press 'i' to start typing",
+            "esc normal",
+            "enter send",
+            "shift+enter newline",
+            "ctrl+c clear",
+            "select a workspace",
+            "status: disconnected",
+            "server unreachable",
+            "press r to retry",
+            "new chat",
+            "workspace:",
+        ]
+        for p in waitingIndicators where lastLower.contains(p) { return .waiting }
+
+        if lastLower.contains("j/k") && lastLower.contains("enter") && lastLower.contains("retry") {
+            return .waiting
+        }
 
         return .idle
     }
@@ -2261,6 +3794,9 @@ class BaseTerminalController: NSWindowController,
 
         // Everything beyond here is setting up the window
         guard let window else { return }
+
+        // Window now exists; apply any existing attention highlight state.
+        syncAttentionTabHighlight()
 
         // We always initialize our fullscreen style to native if we can because
         // initialization sets up some state (i.e. observers). If its set already

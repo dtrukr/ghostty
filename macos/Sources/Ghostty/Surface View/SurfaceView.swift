@@ -122,6 +122,15 @@ extension Ghostty {
                         surfaceView.toggleReadonly(nil)
                     }
                 }
+
+                if surfaceView.attentionAgentBadgeSource != .none,
+                   !surfaceView.attentionAgentBadgeProvider.isEmpty
+                {
+                    SurfaceAgentBadge(
+                        provider: surfaceView.attentionAgentBadgeProvider,
+                        source: surfaceView.attentionAgentBadgeSource
+                    )
+                }
                 
                 // Show key state indicator for active key tables and/or pending key sequences
                 KeyStateIndicator(
@@ -1049,6 +1058,83 @@ extension Ghostty {
                     }
                 }
             }
+        }
+    }
+
+    // MARK: Agent Badge
+
+    /// A compact per-surface badge indicating whether this pane is considered
+    /// an agent target by explicit mark or by auto detection.
+    struct SurfaceAgentBadge: View {
+        let provider: String
+        let source: SurfaceView.AgentBadgeSource
+
+        private var iconName: String {
+            switch source {
+            case .marked: return "tag.fill"
+            case .detected: return "sparkles"
+            case .diagnostic: return "stethoscope"
+            case .none: return "questionmark"
+            }
+        }
+
+        private var sourceLabel: String {
+            switch source {
+            case .marked: return "M"
+            case .detected: return "A"
+            case .diagnostic: return "D"
+            case .none: return ""
+            }
+        }
+
+        private var tint: Color {
+            switch source {
+            case .marked: return Color(hue: 0.35, saturation: 0.62, brightness: 0.78)
+            case .detected: return Color(hue: 0.58, saturation: 0.58, brightness: 0.86)
+            case .diagnostic: return Color(hue: 0.12, saturation: 0.72, brightness: 0.88)
+            case .none: return .secondary
+            }
+        }
+
+        private var badgeAccessibilitySource: String {
+            switch source {
+            case .marked: return "marked"
+            case .detected: return "auto-detected"
+            case .diagnostic: return "diagnostic-auto-detected"
+            case .none: return "unknown"
+            }
+        }
+
+        var body: some View {
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Image(systemName: iconName)
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("\(provider) \(sourceLabel)")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background {
+                        Capsule(style: .continuous)
+                            .fill(.ultraThinMaterial)
+                            .overlay {
+                                Capsule(style: .continuous)
+                                    .strokeBorder(tint.opacity(0.65), lineWidth: 1.0)
+                            }
+                    }
+                    .foregroundStyle(tint)
+                }
+                .padding(6)
+            }
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityIdentifier("Ghostty.Surface.AgentBadge")
+            .accessibilityLabel("\(provider) \(badgeAccessibilitySource)")
         }
     }
 

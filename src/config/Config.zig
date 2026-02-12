@@ -1288,6 +1288,21 @@ command: ?Command = null,
 /// Available since 1.4.0.
 @"auto-focus-attention-resume-delay": Duration = .{ .duration = 0 },
 
+/// If non-zero, Ghostty may resume a pending `auto-focus-attention` action
+/// even while the mouse remains inside the focused surface, once no user input
+/// has occurred for at least this duration.
+///
+/// This provides an alternative "done reading" signal to mouse-exit for setups
+/// like `focus-follows-mouse = true`, where moving the cursor out of the pane
+/// can feel disruptive.
+///
+/// Set to `0` to disable this behavior (default).
+///
+/// macOS only.
+///
+/// Available since 1.5.0.
+@"auto-focus-attention-resume-on-focused-idle": Duration = .{ .duration = 0 },
+
 /// If true, and `auto-focus-attention` is pending due to an attention mark that
 /// arrived while you were focused in a surface, switching focus to a different
 /// surface will resume auto-focus-attention (optionally delayed by
@@ -1305,6 +1320,96 @@ command: ?Command = null,
 ///
 /// Available since 1.4.0.
 @"auto-focus-attention-resume-on-surface-switch": bool = false,
+
+/// Controls which attention-marked surfaces are eligible for
+/// `auto-focus-attention`.
+///
+/// Available values:
+///
+///   * `all` - Any surface with attention is eligible.
+///   * `agents` - Only watched providers (Codex/OpenCode/etc.) are eligible.
+///   * `marked` - Only explicitly marked surfaces are eligible.
+///   * `agents-or-marked` - Watched providers and explicitly marked surfaces are eligible.
+///
+/// macOS only.
+@"auto-focus-attention-watch-mode": AutoFocusAttentionWatchMode = .@"agents-or-marked",
+
+/// Comma-separated list of watched provider names used by
+/// `auto-focus-attention-watch-mode = agents` and
+/// `auto-focus-attention-watch-mode = agents-or-marked`.
+///
+/// Matching is case-insensitive and supports aliases (for example,
+/// `open code` normalizes to `opencode`; `ag` normalizes to `ag-tui`).
+///
+/// macOS only.
+@"attention-watch-providers": [:0]const u8 = "codex,opencode,ag-tui",
+
+/// Comma-separated list of allowed provider names for explicit surface tags
+/// (`attention-surface-tag-prefix`/`attention-surface-tag-suffix`) when
+/// `attention-surface-tag-allow-any = false`.
+///
+/// This is separate from `attention-watch-providers` so you can keep auto-detection
+/// strict (for example, only `codex,opencode`) while still allowing manual
+/// marks for other providers (for example, `gemini`).
+///
+/// If empty (default), Ghostty falls back to `attention-watch-providers` for
+/// backward compatibility.
+///
+/// Matching is case-insensitive and supports aliases (for example,
+/// `open code` normalizes to `opencode`; `ag` normalizes to `ag-tui`).
+///
+/// macOS only.
+@"attention-surface-tag-providers": [:0]const u8 = "",
+
+/// If true, once a surface is auto-detected as a watched provider, Ghostty
+/// keeps that provider stable for the surface until strong evidence indicates
+/// the provider actually changed.
+///
+/// This reduces badge/provider flicker from cross-mentions in transcripts
+/// (for example, Codex discussing OpenCode, or vice versa) when users keep one
+/// long-lived agent session per pane.
+///
+/// Locking only affects autodetected providers. Explicit title marks still
+/// take priority and are not modified by this setting.
+///
+/// macOS only.
+@"attention-provider-lock": bool = false,
+
+/// Controls background agent autodetection diagnostics independent of
+/// `auto-focus-attention-watch-mode` eligibility.
+///
+/// Available values:
+///
+///   * `off` - Disable diagnostics-only autodetection.
+///   * `marked` - In `watch-mode = marked`, autodetect only explicitly marked surfaces.
+///   * `all` - In `watch-mode = marked`, autodetect all surfaces.
+///
+/// Diagnostics mode only affects visual/debug/export signals. It does not change
+/// which surfaces are eligible for auto-focus-attention.
+///
+/// macOS only.
+@"attention-autodetect-diagnostics": AttentionAutodetectDiagnostics = .off,
+
+/// Prefix used to detect explicit surface marks in titles.
+///
+/// With the default prefix/suffix, a title such as `[agent:codex] build`
+/// marks the surface as `codex`.
+///
+/// macOS only.
+@"attention-surface-tag-prefix": [:0]const u8 = "[agent:",
+
+/// Suffix used to detect explicit surface marks in titles.
+///
+/// macOS only.
+@"attention-surface-tag-suffix": [:0]const u8 = "]",
+
+/// If true, explicit title tags (`[agent:NAME]`) are accepted for any NAME.
+/// If false, only names present in `attention-surface-tag-providers` are accepted.
+/// When `attention-surface-tag-providers` is empty, this falls back to
+/// `attention-watch-providers` for backward compatibility.
+///
+/// macOS only.
+@"attention-surface-tag-allow-any": bool = true,
 
 /// If true (default), Ghostty clears the "needs attention" state as soon as a
 /// surface gains focus (e.g. after `goto_attention` or auto-focus-attention).
@@ -8767,6 +8872,21 @@ pub const BellFeatures = packed struct {
     attention: bool = true,
     title: bool = true,
     border: bool = false,
+};
+
+/// See auto-focus-attention-watch-mode
+pub const AutoFocusAttentionWatchMode = enum {
+    all,
+    agents,
+    marked,
+    @"agents-or-marked",
+};
+
+/// See attention-autodetect-diagnostics
+pub const AttentionAutodetectDiagnostics = enum {
+    off,
+    marked,
+    all,
 };
 
 /// See mouse-shift-capture

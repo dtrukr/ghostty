@@ -82,6 +82,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             keybind = cmd+]=goto_attention:next
             keybind = cmd+[=goto_attention:previous
@@ -100,6 +101,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             attention-on-output-idle = 200ms
             """
@@ -148,6 +150,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             # No auto-focus; we want to inspect the unfocused pane border.
             auto-focus-attention = false
@@ -231,6 +234,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
             auto-focus-attention = false
             attention-on-output-idle = 1500ms
             focus-follows-mouse = false
@@ -343,6 +347,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
             auto-focus-attention = false
             attention-on-output-idle = 1500ms
             focus-follows-mouse = false
@@ -408,6 +413,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 50ms
@@ -481,6 +487,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 200ms
@@ -557,6 +564,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 200ms
@@ -668,6 +676,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 250ms
@@ -756,6 +765,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 50ms
@@ -818,11 +828,11 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
 
         let overlay = app.otherElements["Ghostty.Attention.Overlay"]
         XCTAssertTrue(overlay.waitForExistence(timeout: 2), "Expected attention overlay to exist when attention-debug=true")
-        XCTAssertTrue(overlay.label.contains("resume in 2500ms"), "Expected overlay to show resume delay, got: \(overlay.label)")
+        XCTAssertTrue(overlay.label.contains("resumeWait") || overlay.label.contains("resume in"), "Expected overlay to show resume delay, got: \(overlay.label)")
 
         // Before the resume delay elapses, we should not have focused pane B yet.
         try await Task.sleep(for: .milliseconds(600))
-        XCTAssertTrue(overlay.label.contains("resume in 2500ms"), "Expected overlay to still be waiting, got: \(overlay.label)")
+        XCTAssertTrue(overlay.label.contains("resumeWait") || overlay.label.contains("resume in"), "Expected overlay to still be waiting, got: \(overlay.label)")
 
         // After the delay, we should auto-focus to pane B. Don't assert on overlay
         // text here since focus state changes can legitimately update it.
@@ -848,6 +858,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 50ms
@@ -940,6 +951,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 50ms
@@ -1115,6 +1127,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             confirm-close-surface = false
 
             bell-features = border
+            auto-focus-attention-watch-mode = all
 
             auto-focus-attention = true
             auto-focus-attention-idle = 50ms
@@ -1385,6 +1398,78 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         try await Task.sleep(for: .milliseconds(250))
         let ttyAfter2 = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
         XCTAssertEqual(ttyAfter2, tty2, "Expected second goto_attention to focus tab 2")
+    }
+
+    @MainActor
+    func testAutoFocusAttentionResumesOnFocusedIdleWithoutMouseExit() async throws {
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+
+            bell-features = border
+            auto-focus-attention-watch-mode = all
+
+            auto-focus-attention = true
+            auto-focus-attention-idle = 50ms
+            auto-focus-attention-resume-delay = 700ms
+            auto-focus-attention-resume-on-surface-switch = false
+            auto-focus-attention-resume-on-focused-idle = 1200ms
+            attention-clear-on-focus = true
+            focus-follows-mouse = true
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+
+        func clickPane(_ x: CGFloat) {
+            window.coordinate(withNormalizedOffset: CGVector(dx: x, dy: 0.75)).click()
+        }
+
+        // Create two panes and capture tty for each.
+        clickPane(0.5)
+        try await cdTmp(app)
+        window.typeKey("d", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(600))
+
+        clickPane(0.25)
+        try await cdTmp(app)
+        let ttyA = try await captureTTY(app)
+
+        clickPane(0.75)
+        try await cdTmp(app)
+        let ttyB = try await captureTTY(app)
+
+        // Return to pane A and ring pane B.
+        clickPane(0.25)
+        try await Task.sleep(for: .milliseconds(200))
+        app.typeText("printf '\\a' > \(ttyB)\n")
+
+        // Before focused-idle + resume delay elapses, we should remain on pane A.
+        try await Task.sleep(for: .milliseconds(700))
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyEarly = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(
+            ttyEarly,
+            ttyA,
+            "Expected focus to stay on pane A before focused-idle resume window elapses, got \(ttyEarly)"
+        )
+
+        // Without moving mouse out of pane A, focused-idle should eventually resume auto-focus.
+        try await Task.sleep(for: .milliseconds(1700))
+        app.typeText("tty | pbcopy\n")
+        try await Task.sleep(for: .milliseconds(250))
+        let ttyAfter = try readPasteboardString().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(
+            ttyAfter,
+            ttyB,
+            "Expected focused-idle resume to auto-focus pane B without mouse exit, got \(ttyAfter)"
+        )
     }
 
     private func readPasteboardString(file: StaticString = #filePath, line: UInt = #line) throws -> String {

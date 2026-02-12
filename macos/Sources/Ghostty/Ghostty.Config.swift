@@ -671,12 +671,109 @@ extension Ghostty {
             return v
         }
 
+        /// Idle threshold (milliseconds) to resume pending auto-focus-attention while still focused.
+        /// A value of 0 disables this behavior.
+        var autoFocusAttentionResumeOnFocusedIdle: UInt {
+            guard let config = self.config else { return 0 }
+            var v: UInt = 0
+            let key = "auto-focus-attention-resume-on-focused-idle"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         /// If true, switching focus to a different surface will resume a pending
         /// auto-focus-attention action (subject to auto-focus-attention-resume-delay).
         var autoFocusAttentionResumeOnSurfaceSwitch: Bool {
             guard let config = self.config else { return false }
             var v = false
             let key = "auto-focus-attention-resume-on-surface-switch"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        /// Controls which attention-marked surfaces are eligible for auto-focus-attention.
+        var autoFocusAttentionWatchMode: AutoFocusAttentionWatchMode {
+            let defaultValue: AutoFocusAttentionWatchMode = .agents_or_marked
+            guard let config = self.config else { return defaultValue }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "auto-focus-attention-watch-mode"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
+            guard let ptr = v else { return defaultValue }
+            let str = String(cString: ptr)
+            return AutoFocusAttentionWatchMode(rawValue: str) ?? defaultValue
+        }
+
+        /// Comma-separated list of watched providers used by auto-focus attention filtering.
+        var attentionWatchProviders: String {
+            guard let config = self.config else { return "codex,opencode,ag-tui" }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "attention-watch-providers"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "codex,opencode,ag-tui" }
+            guard let ptr = v else { return "codex,opencode,ag-tui" }
+            return String(cString: ptr)
+        }
+
+        /// Comma-separated provider allowlist for manual surface tags when
+        /// attention-surface-tag-allow-any=false. Empty means fall back to
+        /// attention-watch-providers for backward compatibility.
+        var attentionSurfaceTagProviders: String {
+            guard let config = self.config else { return "" }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "attention-surface-tag-providers"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "" }
+            guard let ptr = v else { return "" }
+            return String(cString: ptr)
+        }
+
+        /// If true, keeps an auto-detected provider sticky per surface until a
+        /// stable provider transition or prompt-based reset is observed.
+        var attentionProviderLock: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "attention-provider-lock"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        /// Controls diagnostics-only autodetection scan scope for agent badges/exports.
+        var attentionAutodetectDiagnostics: AttentionAutodetectDiagnostics {
+            let defaultValue: AttentionAutodetectDiagnostics = .off
+            guard let config = self.config else { return defaultValue }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "attention-autodetect-diagnostics"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
+            guard let ptr = v else { return defaultValue }
+            let str = String(cString: ptr)
+            return AttentionAutodetectDiagnostics(rawValue: str) ?? defaultValue
+        }
+
+        /// Prefix used for explicit surface marks in titles (e.g. "[agent:codex]").
+        var attentionSurfaceTagPrefix: String {
+            guard let config = self.config else { return "[agent:" }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "attention-surface-tag-prefix"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "[agent:" }
+            guard let ptr = v else { return "[agent:" }
+            return String(cString: ptr)
+        }
+
+        /// Suffix used for explicit surface marks in titles.
+        var attentionSurfaceTagSuffix: String {
+            guard let config = self.config else { return "]" }
+            var v: UnsafePointer<Int8>? = nil
+            let key = "attention-surface-tag-suffix"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "]" }
+            guard let ptr = v else { return "]" }
+            return String(cString: ptr)
+        }
+
+        /// If true, explicit title tags are accepted for any provider name.
+        /// If false, tags must be in attention-surface-tag-providers (or
+        /// attention-watch-providers when that list is empty).
+        var attentionSurfaceTagAllowAny: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "attention-surface-tag-allow-any"
             _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
             return v
         }
@@ -916,6 +1013,19 @@ extension Ghostty.Config {
         case never
         case unfocused
         case always
+    }
+
+    enum AutoFocusAttentionWatchMode: String {
+        case all
+        case agents
+        case marked
+        case agents_or_marked = "agents-or-marked"
+    }
+
+    enum AttentionAutodetectDiagnostics: String {
+        case off
+        case marked
+        case all
     }
 
     struct NotifyOnCommandFinishAction: OptionSet {

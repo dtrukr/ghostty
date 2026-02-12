@@ -139,6 +139,19 @@ extension Ghostty {
         /// True when the surface should show a highlight effect (e.g., when presented via goto_split).
         @Published private(set) var highlighted: Bool = false
 
+        enum AgentBadgeSource: String {
+            case none
+            case detected
+            case marked
+            case diagnostic
+        }
+
+        /// Provider text shown in the per-surface agent badge (empty when hidden).
+        @Published private(set) var attentionAgentBadgeProvider: String = ""
+
+        /// Source shown in the per-surface agent badge.
+        @Published private(set) var attentionAgentBadgeSource: AgentBadgeSource = .none
+
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
         var initialSize: NSSize? = nil
@@ -450,13 +463,7 @@ extension Ghostty {
                 // prefer to keep the visual "needs attention" highlight until
                 // the user actually interacts with the surface.
                 if derivedConfig.attentionClearOnFocus {
-                    if derivedConfig.attentionDebug, self.bell {
-                        let sid = self.id.uuidString
-                        let msg = "attention clear reason=focus surface=\(sid)"
-                        Ghostty.logger.info("\(msg, privacy: .public)")
-                    }
-                    bell = false
-                    bellInstant = nil
+                    clearAttention(reason: "focus")
                 }
 
                 // Remove any notifications for this surface once we gain focus.
@@ -629,8 +636,92 @@ extension Ghostty {
             }
         }
 
-        // MARK: Local Events
+        func setUserTitle(_ newTitle: String) {
+            if titleFromTerminal == nil {
+                titleFromTerminal = title
+            }
+            title = newTitle
+        }
 
+        func clearUserTitleOverride() {
+            let prevTitle = titleFromTerminal ?? "👻"
+            titleFromTerminal = nil
+            setTitle(prevTitle)
+        }
+
+        func setAttentionAgentTag(name: String, prefix: String, suffix: String) {
+            let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedName.isEmpty else { return }
+            guard !prefix.isEmpty, !suffix.isEmpty else { return }
+
+            let current = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let withoutTag = stripAttentionAgentTag(from: current, prefix: prefix, suffix: suffix)
+            let marked = "\(prefix)\(trimmedName)\(suffix)"
+            let newTitle = withoutTag.isEmpty ? marked : "\(marked) \(withoutTag)"
+            setUserTitle(newTitle)
+        }
+
+        func clearAttentionAgentTag(prefix: String, suffix: String) {
+            guard !prefix.isEmpty, !suffix.isEmpty else { return }
+            let current = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let withoutTag = stripAttentionAgentTag(from: current, prefix: prefix, suffix: suffix)
+            guard withoutTag != current else { return }
+
+            if withoutTag.isEmpty {
+                clearUserTitleOverride()
+            } else {
+                setUserTitle(withoutTag)
+            }
+        }
+
+        func setAttentionAgentBadge(provider: String, source: AgentBadgeSource) {
+            let normalized = provider
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !normalized.isEmpty else {
+                clearAttentionAgentBadge()
+                return
+            }
+            if attentionAgentBadgeProvider == normalized,
+               attentionAgentBadgeSource == source
+            {
+                return
+            }
+            attentionAgentBadgeProvider = normalized
+            attentionAgentBadgeSource = source
+        }
+
+        func clearAttentionAgentBadge() {
+            if attentionAgentBadgeProvider.isEmpty,
+               attentionAgentBadgeSource == .none
+            {
+                return
+            }
+            attentionAgentBadgeProvider = ""
+            attentionAgentBadgeSource = .none
+        }
+
+        func clearAttention(reason: String) {
+            if derivedConfig.attentionDebug, self.bell {
+                let sid = self.id.uuidString
+                let msg = "attention clear reason=\(reason) surface=\(sid)"
+                Ghostty.logger.info("\(msg, privacy: .public)")
+            }
+            bell = false
+            bellInstant = nil
+        }
+
+        private func stripAttentionAgentTag(from value: String, prefix: String, suffix: String) -> String {
+            let input = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard input.hasPrefix(prefix) else { return input }
+            let tagStart = input.index(input.startIndex, offsetBy: prefix.count)
+            guard let suffixRange = input.range(of: suffix, range: tagStart..<input.endIndex) else {
+                return input
+            }
+            return String(input[suffixRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // MARK: Local Events
         private func localEventHandler(_ event: NSEvent) -> NSEvent? {
             return switch event.type {
             case .keyUp:

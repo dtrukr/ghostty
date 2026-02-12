@@ -60,6 +60,7 @@ struct TerminalCommandPaletteView: View {
         var options: [CommandOption] = []
         // Updates always appear first
         options.append(contentsOf: updateOptions)
+        options.append(contentsOf: agentMarkOptions)
         
         // Sort the rest. We replace ":" with a character that sorts before space
         // so that "Foo:" sorts before "Foo Bar:". Use sortKey as a tie-breaker
@@ -77,17 +78,93 @@ struct TerminalCommandPaletteView: View {
             }
             return false
         })
+
+        return options
+    }
+
+    /// Commands for explicitly marking/unmarking this surface as an agent pane.
+    private var agentMarkOptions: [CommandOption] {
+        var options: [CommandOption] = [
+            CommandOption(
+                title: "Agent: Mark Surface...",
+                description: "Set an explicit [agent:NAME] surface tag for attention filtering."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.promptSurfaceAgentMark(surfaceView)
+            },
+        ]
+
+        options.append(contentsOf: BaseTerminalController.quickSurfaceAgentProviders.map { provider in
+            CommandOption(
+                title: "Agent: Mark as \(provider.displayName)",
+                description: "Set an explicit surface mark for \(provider.token)."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.markSurfaceAgent(provider.token, surface: surfaceView)
+            }
+        })
+
+        options.append(
+            CommandOption(
+                title: "Agent: Clear Surface Mark",
+                description: "Remove the [agent:NAME] tag from this surface title."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.clearSurfaceAgentMark(surfaceView)
+            }
+        )
+
+        options.append(
+            CommandOption(
+                title: "Agent: Export Detection Snapshot...",
+                description: "Export a one-shot detection snapshot for this surface. Auto-captures 5s first if needed."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.exportAgentAutodetectionDebugLog(surfaceView)
+            }
+        )
+
+        options.append(
+            CommandOption(
+                title: "Agent: Start Focused Detection Poll Trace",
+                description: "Start a per-poll detection timeline for the active surface only."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.startFocusedAgentAutodetectionTrace()
+            }
+        )
+
+        options.append(
+            CommandOption(
+                title: "Agent: Stop Focused Detection Poll Trace",
+                description: "Stop the focused per-poll detection timeline."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.stopFocusedAgentAutodetectionTrace()
+            }
+        )
+
+        options.append(
+            CommandOption(
+                title: "Agent: Export Focused Detection Poll Trace...",
+                description: "Export focused per-poll timeline. Auto-captures 5s first if needed."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.exportFocusedAgentAutodetectionTraceAndStop()
+            }
+        )
+
         return options
     }
 
     /// Commands for installing or canceling available updates.
     private var updateOptions: [CommandOption] {
         var options: [CommandOption] = []
-        
+
         guard let updateViewModel, updateViewModel.state.isInstallable else {
             return options
         }
-        
+
         // We override the update available one only because we want to properly
         // convey it'll go all the way through.
         let title: String
@@ -96,7 +173,7 @@ struct TerminalCommandPaletteView: View {
         } else {
             title = updateViewModel.text
         }
-        
+
         options.append(CommandOption(
             title: title,
             description: updateViewModel.description,
@@ -106,14 +183,14 @@ struct TerminalCommandPaletteView: View {
         ) {
             (NSApp.delegate as? AppDelegate)?.updateController.installUpdate()
         })
-        
+
         options.append(CommandOption(
             title: "Cancel or Skip Update",
             description: "Dismiss the current update process"
         ) {
             updateViewModel.state.cancel()
         })
-        
+
         return options
     }
 

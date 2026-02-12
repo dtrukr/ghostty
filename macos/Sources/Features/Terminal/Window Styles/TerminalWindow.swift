@@ -57,10 +57,14 @@ class TerminalWindow: NSWindow {
     var tabColor: TerminalTabColor = .none {
         didSet {
             guard tabColor != oldValue else { return }
-            tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
+            refreshTabColorIndicator()
             invalidateRestorableState()
         }
     }
+
+    // Transient tab color override used for runtime signals (such as attention).
+    // This never affects restorable/manual tab color state.
+    private var transientTabColor: TerminalTabColor? = nil
 
     // MARK: NSWindow Overrides
 
@@ -153,7 +157,7 @@ class TerminalWindow: NSWindow {
         // Setup the accessory view for tabs that shows our keyboard shortcuts,
         // zoomed state, etc. Note I tried to use SwiftUI here but ran into issues
         // where buttons were not clickable.
-        tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
+        refreshTabColorIndicator()
 
         let stackView = NSStackView()
         stackView.orientation = .horizontal
@@ -167,6 +171,12 @@ class TerminalWindow: NSWindow {
 
         // Get our saved level
         level = UserDefaults.standard.value(forKey: Self.defaultLevelKey) as? NSWindow.Level ?? .normal
+    }
+
+    func setTransientTabColor(_ color: TerminalTabColor?) {
+        guard transientTabColor != color else { return }
+        transientTabColor = color
+        refreshTabColorIndicator()
     }
 
     // Both of these must be true for windows without decorations to be able to
@@ -235,6 +245,12 @@ class TerminalWindow: NSWindow {
         }
 
         super.removeTitlebarAccessoryViewController(at: index)
+    }
+
+    private func refreshTabColorIndicator() {
+        tabColorIndicator.rootView = TabColorIndicatorView(
+            tabColor: transientTabColor ?? tabColor
+        )
     }
 
     // MARK: Tab Bar

@@ -62,6 +62,27 @@ Optional: auto-focus the most recent attention surface after you have been idle:
 ```conf
 auto-focus-attention = true
 auto-focus-attention-idle = 5000ms
+
+# Only watch known agent panes by default.
+auto-focus-attention-watch-mode = agents-or-marked
+attention-watch-providers = codex,opencode,ag-tui
+
+# Keep auto-detected provider sticky per surface (reduces codex/opencode flicker).
+attention-provider-lock = true
+
+# Explicitly mark a surface by title tag.
+# Example title: [agent:codex] build
+attention-surface-tag-prefix = "[agent:"
+attention-surface-tag-suffix = "]"
+attention-surface-tag-allow-any = true
+# Optional: separate manual-tag allowlist (when allow-any=false).
+# Empty = fallback to attention-watch-providers.
+# attention-surface-tag-providers = codex,opencode,gemini
+
+# Optional: while focused in a pane (mouse still inside), allow pending
+# auto-focus to resume after no input for this long.
+# Set 0ms (default) to require mouse-exit/surface-switch to resume.
+auto-focus-attention-resume-on-focused-idle = 0ms
 ```
 
 Optional: prevent "spam" focus switches for very fast attention marks by
@@ -304,6 +325,58 @@ When attention becomes pending:
 4. If no surface is focused (terminal isn't first responder):
    - Auto-focus waits for `auto-focus-attention-idle` of user-idle, then focuses
      the most recent attention surface.
+5. Optional focused-idle resume:
+   - If `auto-focus-attention-resume-on-focused-idle > 0`, pending auto-focus may
+     resume even while the mouse remains inside the focused pane once no input
+     has occurred for the configured duration.
+
+Candidate filtering:
+
+- `auto-focus-attention-watch-mode = all`
+  - Legacy behavior. Any attention-marked surface can be auto-focused.
+- `auto-focus-attention-watch-mode = agents`
+  - Only surfaces detected as watched providers are eligible.
+- `auto-focus-attention-watch-mode = marked`
+  - Only surfaces with an explicit title tag (`[agent:NAME]` by default) are eligible.
+- `auto-focus-attention-watch-mode = agents-or-marked`
+  - Union of the above; this is the recommended noise-reduction mode.
+
+Provider watch list:
+
+- `attention-watch-providers` is a comma-separated provider list for auto-detection/watch eligibility.
+- `attention-surface-tag-providers` is a separate manual-tag allowlist used when
+  `attention-surface-tag-allow-any = false`.
+- Detection is case-insensitive and normalizes common aliases (for example,
+  `open code` maps to `opencode`; `ag` maps to `ag-tui`).
+- `attention-provider-lock = true` keeps an auto-detected provider stable per surface
+  until consistent evidence indicates a provider switch or prompt return.
+
+Diagnostics-only autodetection:
+
+- `attention-autodetect-diagnostics = off` (default) disables diagnostics scans in `watch-mode = marked`.
+- `attention-autodetect-diagnostics = marked` scans only explicitly marked surfaces in `watch-mode = marked`.
+- `attention-autodetect-diagnostics = all` scans all surfaces in `watch-mode = marked`.
+- Diagnostics mode affects badge/debug/export visibility only; auto-focus eligibility still follows `auto-focus-attention-watch-mode`.
+
+Explicit marking via title:
+
+- Set a title like `[agent:codex] ...` (default syntax) to mark a surface.
+- You can also use Command Palette actions:
+  - `Agent: Mark Surface...`
+  - `Agent: Clear Surface Mark`
+- This works across local/SSH/tmux scenarios as long as title updates propagate.
+- If `attention-surface-tag-allow-any = false`, only names in
+  `attention-surface-tag-providers` count as valid explicit marks.
+- If `attention-surface-tag-providers` is empty, Ghostty falls back to
+  `attention-watch-providers` for backward compatibility.
+
+Per-surface badge (UI):
+
+- Ghostty shows a small top-left badge on each surface when agent filtering is
+  active (`auto-focus-attention-watch-mode != all`) or when `attention-debug = true`.
+- `tag` badge = explicitly marked surface (`[agent:NAME]`).
+- `sparkles` badge = auto-detected provider (title/viewport heuristics).
+- `stethoscope` badge = diagnostics-only autodetection signal (does not affect watch eligibility).
 
 Additionally, auto-focus can enforce a minimum attention age:
 
@@ -325,9 +398,17 @@ Optional: `auto-focus-attention-resume-on-surface-switch = true`
 
 - If attention is pending and you switch focus to a different pane, Ghostty
   treats that as a "done reading the previous pane" signal and queues the
-  resume logic (it bypasses the focus-pause check for this resume).
-- This resume is intentionally allowed even if the mouse is inside the newly
-  focused pane (the explicit focus change is taken as the user's signal).
+  normal resume logic.
+- Resume still respects focus-pause and recent activity guards unless the
+  focused-idle threshold is reached.
+
+Optional: `auto-focus-attention-resume-on-focused-idle = <duration>`
+
+- If pending attention arrives while you're focused in a pane and you keep the
+  mouse inside it (common with `focus-follows-mouse = true`), Ghostty can
+  resume after an explicit no-input period instead of requiring mouse-exit.
+- Any user activity (typing, click, scroll, mouse move) resets this timer.
+- Set to `0ms` to disable (default).
 
 Notes:
 
