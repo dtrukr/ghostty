@@ -668,16 +668,21 @@ private struct TabColorIndicatorView: View {
     let tabColor: TerminalTabColor
 
     var body: some View {
-        if let color = tabColor.displayColor {
-            Circle()
-                .fill(Color(color))
-                .frame(width: 6, height: 6)
-        } else {
-            Circle()
-                .fill(Color.clear)
-                .frame(width: 6, height: 6)
-                .hidden()
+        Group {
+            if let color = tabColor.displayColor {
+                Circle()
+                    .fill(Color(color))
+                    .frame(width: 6, height: 6)
+            } else {
+                Circle()
+                    .fill(Color.clear)
+                    .frame(width: 6, height: 6)
+                    .opacity(0)
+            }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("Ghostty.TabColorIndicator")
+        .accessibilityLabel("TabColor:\(tabColor.localizedName)")
     }
 }
 

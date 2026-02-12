@@ -69,6 +69,14 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
         return c.r >= 110 && c.g >= 90 && c.b <= 160 && c.r >= c.g
     }
 
+    private func attachScreenshot(_ screenshot: XCUIScreenshot, name: String) {
+        let attachment = XCTAttachment(image: screenshot.image)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+
     override func setUp() async throws {
         try await super.setUp()
 
@@ -494,7 +502,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             auto-focus-attention-resume-delay = 0ms
 
             # Default is true, but make the behavior explicit for this test:
-            attention-clear-on-focus = true
+            attention-clear-on-focus = false
             """
         )
 
@@ -570,7 +578,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             auto-focus-attention-idle = 200ms
             auto-focus-attention-resume-delay = 0ms
             auto-focus-attention-resume-on-surface-switch = true
-            attention-clear-on-focus = true
+            attention-clear-on-focus = false
             attention-debug = true
             """
         )
@@ -684,7 +692,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
 
             # Make sure attention marks clear when we focus them so the "prefer current tab"
             # portion of this test doesn't leave stale candidates behind.
-            attention-clear-on-focus = true
+            attention-clear-on-focus = false
 
             attention-debug = true
             """
@@ -1132,7 +1140,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             auto-focus-attention = true
             auto-focus-attention-idle = 50ms
             auto-focus-attention-resume-delay = 0ms
-            attention-clear-on-focus = true
+            attention-clear-on-focus = false
             attention-debug = true
             """
         )
@@ -1415,7 +1423,7 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             auto-focus-attention-resume-delay = 700ms
             auto-focus-attention-resume-on-surface-switch = false
             auto-focus-attention-resume-on-focused-idle = 1200ms
-            attention-clear-on-focus = true
+            attention-clear-on-focus = false
             focus-follows-mouse = true
             """
         )
@@ -1469,6 +1477,101 @@ final class GhosttyAttentionUITests: GhosttyCustomConfigCase {
             ttyAfter,
             ttyB,
             "Expected focused-idle resume to auto-focus pane B without mouse exit, got \(ttyAfter)"
+        )
+    }
+
+    @MainActor
+    func testTabIndicatorTurnsYellowForPendingAttentionAndClearsOnFocus() async throws {
+        try updateConfig(
+            """
+            title = "GhosttyAttentionUITests"
+            confirm-close-surface = false
+            macos-titlebar-style = tabs
+
+            bell-features = border
+            auto-focus-attention = false
+            auto-focus-attention-watch-mode = all
+            attention-clear-on-focus = false
+            """
+        )
+
+        let app = try ghosttyApplication()
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 2), "Main window should exist")
+
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.75)).click()
+        try await cdTmp(app)
+
+        window.typeKey("t", modifierFlags: .command)
+        try await Task.sleep(for: .milliseconds(400))
+
+        func selectTab(_ index: String) async throws {
+            window.typeKey(index, modifierFlags: .command)
+            try await Task.sleep(for: .milliseconds(300))
+            try await cdTmp(app)
+        }
+
+        try await selectTab("1")
+        let tty1 = try await captureTTY(app)
+
+        try await selectTab("2")
+        let tty2 = try await captureTTY(app)
+
+        XCTAssertNotEqual(tty1, tty2, "Expected separate PTYs per tab")
+
+        let tab2 = window.tabs.element(boundBy: 1)
+        XCTAssertTrue(tab2.exists, "Expected second tab to exist")
+
+        let indicators = app.descendants(matching: .any)
+            .matching(identifier: "Ghostty.TabColorIndicator")
+
+        func indicatorLabels() -> [String] {
+            indicators.allElementsBoundByIndex
+                .map { $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        }
+
+        func hasYellow(_ labels: [String]) -> Bool {
+            labels.contains(where: { $0.contains("yellow") })
+        }
+
+        try await selectTab("1")
+
+        let beforeShot = window.screenshot()
+        attachScreenshot(beforeShot, name: "tab-indicator-before-attention")
+        let beforeLabels = indicatorLabels()
+        XCTAssertFalse(
+            hasYellow(beforeLabels),
+            "Expected no yellow tab indicator before attention, labels=\(beforeLabels)"
+        )
+
+        try await selectTab("2")
+        app.typeText("(sleep 0.8; printf '\\a') &\n")
+        try await Task.sleep(for: .milliseconds(150))
+        try await selectTab("1")
+
+        // Focus the attention tab; with attention-clear-on-focus=false,
+        // the yellow indicator should remain visible.
+        try await selectTab("2")
+
+        var yellowLabels: [String] = []
+        var sawYellow = false
+        for _ in 0..<10 {
+            try await Task.sleep(for: .milliseconds(250))
+            yellowLabels = indicatorLabels()
+            if hasYellow(yellowLabels) {
+                sawYellow = true
+                break
+            }
+        }
+
+        let afterShot = window.screenshot()
+        attachScreenshot(afterShot, name: "tab-indicator-after-attention")
+
+        XCTAssertTrue(
+            sawYellow,
+            "Expected at least one tab indicator to become yellow after pending attention, labels=\(yellowLabels)"
         )
     }
 
