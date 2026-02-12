@@ -79,6 +79,7 @@ struct TerminalCommandPaletteView: View {
             return false
         })
 
+
         return options
     }
 
@@ -154,6 +155,26 @@ struct TerminalCommandPaletteView: View {
             }
         )
 
+
+        options.append(
+            CommandOption(
+                title: "Agent: Export Auto-Focus Trace...",
+                description: "Export always-on auto-focus decision trace (no terminal output)."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.exportAutoFocusAttentionTrace()
+            }
+        )
+
+        options.append(
+            CommandOption(
+                title: "Agent: Clear Auto-Focus Trace",
+                description: "Clear the in-memory auto-focus decision trace buffer."
+            ) {
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
+                controller.clearAutoFocusAttentionTrace()
+            }
+        )
         return options
     }
 

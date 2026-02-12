@@ -105,6 +105,19 @@ Optional debug logs:
 attention-debug = true
 ```
 
+Optional always-on auto-focus trace (lightweight, no viewport/terminal output):
+
+```conf
+attention-auto-focus-trace = true
+attention-auto-focus-trace-capacity = 4000
+```
+
+Use command palette actions:
+
+- `Agent: Export Auto-Focus Trace...`
+- `Agent: Clear Auto-Focus Trace`
+
+
 ## Smart Background: Implementation Details
 
 ### Data Flow Summary

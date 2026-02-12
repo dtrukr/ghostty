@@ -747,6 +747,22 @@ extension Ghostty {
             return AttentionAutodetectDiagnostics(rawValue: str) ?? defaultValue
         }
 
+        var attentionAutoFocusTrace: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "attention-auto-focus-trace"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var attentionAutoFocusTraceCapacity: UInt {
+            guard let config = self.config else { return 4000 }
+            var v: UInt = 0
+            let key = "attention-auto-focus-trace-capacity"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         /// Prefix used for explicit surface marks in titles (e.g. "[agent:codex]").
         var attentionSurfaceTagPrefix: String {
             guard let config = self.config else { return "[agent:" }

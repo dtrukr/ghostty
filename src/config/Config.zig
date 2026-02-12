@@ -1390,6 +1390,23 @@ command: ?Command = null,
 /// macOS only.
 @"attention-autodetect-diagnostics": AttentionAutodetectDiagnostics = .off,
 
+/// Enable a lightweight always-on trace of auto-focus-attention decision flow.
+///
+/// This trace captures scheduling/guard/focus decisions for auto-switch behavior,
+/// but never includes terminal viewport text/output.
+///
+/// Use command palette export actions to dump the in-memory trace to a log file.
+///
+/// macOS only.
+@"attention-auto-focus-trace": bool = false,
+
+/// Maximum number of auto-focus trace events kept in memory (ring buffer).
+///
+/// Larger values keep longer history at the cost of memory.
+///
+/// macOS only.
+@"attention-auto-focus-trace-capacity": u16 = 4000,
+
 /// Prefix used to detect explicit surface marks in titles.
 ///
 /// With the default prefix/suffix, a title such as `[agent:codex] build`

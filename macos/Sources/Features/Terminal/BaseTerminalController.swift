@@ -216,6 +216,18 @@ class BaseTerminalController: NSWindowController,
 
     private let focusedAgentTraceAutoCaptureSeconds: TimeInterval = 5.0
 
+    // Always-on lightweight trace for auto-focus attention decisions (no viewport capture).
+    private var autoFocusTraceSeq: UInt64 = 0
+    private var autoFocusTraceStartedAt: Date? = nil
+    private var autoFocusTraceRing: [String?] = []
+    private var autoFocusTraceRingWriteIndex: Int = 0
+    private var autoFocusTraceRingCount: Int = 0
+    private let autoFocusTraceDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     var focusedAgentTraceActive: Bool {
         focusedAgentTraceEnabled
     }
@@ -365,6 +377,9 @@ class BaseTerminalController: NSWindowController,
 
         // Start/stop agent detection (debug overlay and/or per-surface badges).
         syncAgentStatusDetection()
+
+        // Initialize always-on auto-focus trace configuration.
+        syncAutoFocusTraceConfig()
     }
 
     deinit {
@@ -839,6 +854,234 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    func clearAutoFocusAttentionTrace() {
+        let wasEnabled = autoFocusTraceIsEnabled()
+        clearAutoFocusTraceBuffer(keepEnabled: true)
+        if wasEnabled {
+            recordAutoFocusTrace(event: "trace-cleared", reason: "manual")
+        }
+    }
+
+    func exportAutoFocusAttentionTrace() {
+        guard let window else { return }
+
+        let lines = autoFocusTraceSnapshotLines()
+        guard !lines.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No Auto-Focus Trace Data"
+            alert.informativeText = "Enable attention-auto-focus-trace and reproduce the issue first."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: window, completionHandler: nil)
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Auto-Focus Attention Trace"
+        panel.message = "Exports always-on auto-focus decision timeline (no terminal output)."
+        panel.nameFieldStringValue = "ghostty-auto-focus-trace-\(debugLogTimestamp()).log"
+        panel.canCreateDirectories = true
+        panel.allowedFileTypes = ["log", "txt"]
+        panel.isExtensionHidden = false
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let url = panel.url else { return }
+
+            do {
+                let payload = self.buildAutoFocusTraceLog()
+                try payload.write(to: url, atomically: true, encoding: .utf8)
+                Ghostty.logger.info("exported auto-focus trace to \(url.path, privacy: .public)")
+                let target = self.windowFirstResponderSurfaceView() ?? self.focusedSurface
+                self.copyExportPathToClipboardAndNotify(url: url, surface: target, kind: "Auto-focus trace")
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Failed to Export Auto-Focus Trace"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+        }
+    }
+
+    private func autoFocusTraceIsEnabled() -> Bool {
+        ghostty.config.attentionAutoFocusTrace
+    }
+
+    private func normalizedAutoFocusTraceCapacity() -> Int {
+        let raw = Int(ghostty.config.attentionAutoFocusTraceCapacity)
+        let fallback = 4000
+        let v = raw > 0 ? raw : fallback
+        return max(128, min(v, 20000))
+    }
+
+    private func clearAutoFocusTraceBuffer(keepEnabled: Bool = false) {
+        autoFocusTraceSeq = 0
+        autoFocusTraceStartedAt = nil
+        autoFocusTraceRingWriteIndex = 0
+        autoFocusTraceRingCount = 0
+        autoFocusTraceRing.removeAll(keepingCapacity: false)
+
+        if keepEnabled, autoFocusTraceIsEnabled() {
+            autoFocusTraceRing = Array(repeating: nil, count: normalizedAutoFocusTraceCapacity())
+            autoFocusTraceStartedAt = Date()
+        }
+    }
+
+    private func syncAutoFocusTraceConfig() {
+        guard autoFocusTraceIsEnabled() else {
+            clearAutoFocusTraceBuffer(keepEnabled: false)
+            return
+        }
+
+        let capacity = normalizedAutoFocusTraceCapacity()
+        if autoFocusTraceRing.count != capacity {
+            let old = autoFocusTraceSnapshotLines().suffix(capacity)
+            autoFocusTraceRing = Array(repeating: nil, count: capacity)
+            autoFocusTraceRingWriteIndex = 0
+            autoFocusTraceRingCount = 0
+            for line in old {
+                appendAutoFocusTraceLine(line)
+            }
+        } else if autoFocusTraceRing.isEmpty {
+            autoFocusTraceRing = Array(repeating: nil, count: capacity)
+        }
+
+        if autoFocusTraceStartedAt == nil {
+            autoFocusTraceStartedAt = Date()
+            recordAutoFocusTrace(event: "trace-enabled", reason: "config")
+        }
+    }
+
+    private func appendAutoFocusTraceLine(_ line: String) {
+        guard !autoFocusTraceRing.isEmpty else { return }
+        autoFocusTraceRing[autoFocusTraceRingWriteIndex] = line
+        autoFocusTraceRingWriteIndex = (autoFocusTraceRingWriteIndex + 1) % autoFocusTraceRing.count
+        if autoFocusTraceRingCount < autoFocusTraceRing.count {
+            autoFocusTraceRingCount += 1
+        }
+    }
+
+    private func autoFocusTraceSnapshotLines() -> [String] {
+        guard autoFocusTraceRingCount > 0, !autoFocusTraceRing.isEmpty else { return [] }
+
+        var lines: [String] = []
+        lines.reserveCapacity(autoFocusTraceRingCount)
+        let start = (autoFocusTraceRingWriteIndex - autoFocusTraceRingCount + autoFocusTraceRing.count) % autoFocusTraceRing.count
+        for i in 0..<autoFocusTraceRingCount {
+            let idx = (start + i) % autoFocusTraceRing.count
+            if let line = autoFocusTraceRing[idx] {
+                lines.append(line)
+            }
+        }
+
+        return lines
+    }
+
+    private func traceQuoted(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+        return "\"\(escaped)\""
+    }
+
+    private func traceShortId(_ id: UUID?) -> String {
+        guard let id else { return "-" }
+        return String(id.uuidString.prefix(8))
+    }
+
+    private func traceShortSurface(_ surface: Ghostty.SurfaceView?) -> String {
+        traceShortId(surface?.id)
+    }
+
+    private func recordAutoFocusTrace(
+        event: String,
+        reason: String? = nil,
+        target: Ghostty.SurfaceView? = nil,
+        details: [String: String] = [:]
+    ) {
+        guard autoFocusTraceIsEnabled() else { return }
+        syncAutoFocusTraceConfig()
+
+        autoFocusTraceSeq &+= 1
+
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let pendingAgeMs: Int = {
+            guard let since = autoFocusAttentionPendingSinceUptime else { return -1 }
+            return Int(max(0, (nowUptime - since) * 1000.0))
+        }()
+
+        var parts: [String] = []
+        parts.append("seq=\(autoFocusTraceSeq)")
+        parts.append("ts=\(traceQuoted(autoFocusTraceDateFormatter.string(from: Date())))")
+        parts.append("uptime=\(String(format: "%.3f", nowUptime))")
+        parts.append("event=\(traceQuoted(event))")
+        if let reason {
+            parts.append("reason=\(traceQuoted(reason))")
+        }
+
+        parts.append("window=\(window?.windowNumber ?? -1)")
+        parts.append("watch_mode=\(traceQuoted(ghostty.config.autoFocusAttentionWatchMode.rawValue))")
+        parts.append("pending=\(autoFocusAttentionPending ? 1 : 0)")
+        parts.append("pending_age_ms=\(pendingAgeMs)")
+        parts.append("token=\(autoFocusAttentionToken)")
+        parts.append("focused=\(traceShortSurface(windowFirstResponderSurfaceView() ?? focusedSurface))")
+        parts.append("lock=\(traceShortId(autoFocusAttentionFocusLockSurfaceId))")
+        parts.append("paused=\(traceShortId(autoFocusAttentionPausedSurfaceId))")
+
+        let bellSurfaces = attentionSurfacesAcrossTabGroup(applyWatchFilter: false)
+        let watchableCount = bellSurfaces.filter { isAttentionSurfaceWatchableForTrace($0) }.count
+        let allCount = bellSurfaces.count
+        parts.append("marks_watchable=\(watchableCount)")
+        parts.append("marks_all=\(allCount)")
+
+        if let target {
+            parts.append("target=\(traceShortSurface(target))")
+            parts.append("target_window=\(target.window?.windowNumber ?? -1)")
+            parts.append("target_watchable=\(isAttentionSurfaceWatchableForTrace(target) ? 1 : 0)")
+            parts.append("target_bell=\(target.bell ? 1 : 0)")
+            parts.append("target_badge=\(traceQuoted(agentBadgeSummary(for: target)))")
+        }
+
+        if !details.isEmpty {
+            for key in details.keys.sorted() {
+                if let value = details[key] {
+                    parts.append("\(key)=\(traceQuoted(value))")
+                }
+            }
+        }
+
+        appendAutoFocusTraceLine(parts.joined(separator: " "))
+    }
+
+    private func buildAutoFocusTraceLog() -> String {
+        var lines: [String] = []
+        lines.append("# Ghostty Auto-Focus Attention Trace")
+        lines.append("generated_at=\(autoFocusTraceDateFormatter.string(from: Date()))")
+        if let started = autoFocusTraceStartedAt {
+            lines.append("started_at=\(autoFocusTraceDateFormatter.string(from: started))")
+        }
+        lines.append("trace_enabled=\(autoFocusTraceIsEnabled())")
+        lines.append("trace_capacity=\(autoFocusTraceRing.count)")
+        lines.append("trace_events=\(autoFocusTraceRingCount)")
+        lines.append("auto_focus_attention=\(ghostty.config.autoFocusAttention)")
+        lines.append("auto_focus_attention_idle_ms=\(ghostty.config.autoFocusAttentionIdle)")
+        lines.append("auto_focus_attention_resume_delay_ms=\(ghostty.config.autoFocusAttentionResumeDelay)")
+        lines.append("auto_focus_attention_min_age_ms=\(ghostty.config.autoFocusAttentionMinAge)")
+        lines.append("auto_focus_attention_resume_on_surface_switch=\(ghostty.config.autoFocusAttentionResumeOnSurfaceSwitch)")
+        lines.append("auto_focus_attention_resume_on_focused_idle_ms=\(ghostty.config.autoFocusAttentionResumeOnFocusedIdle)")
+        lines.append("auto_focus_attention_watch_mode=\(ghostty.config.autoFocusAttentionWatchMode.rawValue)")
+        lines.append("attention_watch_providers=\(ghostty.config.attentionWatchProviders)")
+        lines.append("attention_provider_lock=\(ghostty.config.attentionProviderLock)")
+        lines.append("")
+
+        lines.append(contentsOf: autoFocusTraceSnapshotLines())
+        return lines.joined(separator: "\n")
+    }
+
     private func captureFocusedAgentTracePollIfActive(
         reason: String,
         surfaces: [Ghostty.SurfaceView]? = nil
@@ -1299,6 +1542,7 @@ class BaseTerminalController: NSWindowController,
 
         // Start/stop agent detection based on debug/watch-mode config.
         syncAgentStatusDetection()
+        syncAutoFocusTraceConfig()
         syncAttentionTabHighlight()
     }
 
@@ -1483,13 +1727,23 @@ class BaseTerminalController: NSWindowController,
 
     @objc private func ghosttyBellDidRing(_ notification: Notification) {
         // Auto-focus is macOS-only behavior and opt-in via config.
-        guard ghostty.config.autoFocusAttention else { return }
+        guard ghostty.config.autoFocusAttention else {
+            recordAutoFocusTrace(event: "bell-ignored", reason: "auto-focus-disabled")
+            return
+        }
 
-        guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard let targetWindow = target.window else { return }
+        guard let target = notification.object as? Ghostty.SurfaceView else {
+            recordAutoFocusTrace(event: "bell-ignored", reason: "missing-target")
+            return
+        }
+        guard let targetWindow = target.window else {
+            recordAutoFocusTrace(event: "bell-ignored", reason: "missing-target-window", target: target)
+            return
+        }
 
         // Respect watch-mode filtering before we enqueue any auto-focus work.
         guard isAttentionSurfaceWatchable(target) else {
+            recordAutoFocusTrace(event: "bell-ignored", reason: "watch-filter", target: target)
             if ghostty.config.attentionDebug {
                 let msg = "attention autofocusing ignored reason=watchFilter surface=\(target.id.uuidString)"
                 Ghostty.logger.info("\(msg, privacy: .public)")
@@ -1500,6 +1754,7 @@ class BaseTerminalController: NSWindowController,
         // "Current window only": keep this within the current window's tab group.
         if let myGroup = window?.tabGroup, let targetGroup = targetWindow.tabGroup {
             guard myGroup === targetGroup else {
+                recordAutoFocusTrace(event: "bell-ignored", reason: "other-tab-group", target: target)
                 if ghostty.config.attentionDebug {
                     let msg = "attention autofocusing ignored reason=otherTabGroup myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
                     Ghostty.logger.info("\(msg, privacy: .public)")
@@ -1508,6 +1763,7 @@ class BaseTerminalController: NSWindowController,
             }
         } else {
             guard targetWindow === window else {
+                recordAutoFocusTrace(event: "bell-ignored", reason: "other-window", target: target)
                 if ghostty.config.attentionDebug {
                     let msg = "attention autofocusing ignored reason=otherWindow myWindow=\(self.window?.windowNumber ?? -1) targetWindow=\(targetWindow.windowNumber)"
                     Ghostty.logger.info("\(msg, privacy: .public)")
@@ -1518,6 +1774,7 @@ class BaseTerminalController: NSWindowController,
 
         // Suppressed when Ghostty isn't frontmost.
         guard NSApp.isActive else {
+            recordAutoFocusTrace(event: "bell-suppressed", reason: "app-inactive", target: target)
             if ghostty.config.attentionDebug {
                 let msg = "attention autofocusing suppressed reason=appInactive"
                 Ghostty.logger.info("\(msg, privacy: .public)")
@@ -1527,6 +1784,7 @@ class BaseTerminalController: NSWindowController,
 
         // Only auto-focus from the key window for this tab group.
         guard window?.isKeyWindow ?? false else {
+            recordAutoFocusTrace(event: "bell-suppressed", reason: "window-not-key", target: target)
             if ghostty.config.attentionDebug {
                 let msg = "attention autofocusing suppressed reason=windowNotKey window=\(self.window?.windowNumber ?? -1)"
                 Ghostty.logger.info("\(msg, privacy: .public)")
@@ -1534,6 +1792,7 @@ class BaseTerminalController: NSWindowController,
             return
         }
         guard !commandPaletteIsShowing else {
+            recordAutoFocusTrace(event: "bell-suppressed", reason: "command-palette", target: target)
             if ghostty.config.attentionDebug {
                 let msg = "attention autofocusing suppressed reason=commandPalette"
                 Ghostty.logger.info("\(msg, privacy: .public)")
@@ -1548,6 +1807,7 @@ class BaseTerminalController: NSWindowController,
 
         autoFocusAttentionPending = true
         autoFocusAttentionPendingSinceUptime = ProcessInfo.processInfo.systemUptime
+        recordAutoFocusTrace(event: "bell-accepted", reason: "scheduled", target: target)
         scheduleAutoFocusAttention()
     }
 
@@ -1588,6 +1848,7 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func scheduleAutoFocusAttention() {
+        recordAutoFocusTrace(event: "schedule", reason: "entry")
         // Do not steal focus while the user is actively "reading" a focused surface.
         // We interpret "reading" as the mouse being inside the focused surface.
         //
@@ -1651,17 +1912,34 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func attemptAutoFocusAttention(token: UInt64, bypassIdle: Bool, bypassFocusPause: Bool) {
-        guard ghostty.config.autoFocusAttention else { return }
-        guard NSApp.isActive else { return }
-        guard window?.isKeyWindow ?? false else { return }
-        guard !commandPaletteIsShowing else { return }
+        recordAutoFocusTrace(event: "attempt", reason: "entry", details: ["token": "\(token)", "bypass_idle": "\(bypassIdle)", "bypass_focus_pause": "\(bypassFocusPause)"])
+        guard ghostty.config.autoFocusAttention else {
+            recordAutoFocusTrace(event: "attempt-abort", reason: "auto-focus-disabled")
+            return
+        }
+        guard NSApp.isActive else {
+            recordAutoFocusTrace(event: "attempt-abort", reason: "app-inactive")
+            return
+        }
+        guard window?.isKeyWindow ?? false else {
+            recordAutoFocusTrace(event: "attempt-abort", reason: "window-not-key")
+            return
+        }
+        guard !commandPaletteIsShowing else {
+            recordAutoFocusTrace(event: "attempt-abort", reason: "command-palette")
+            return
+        }
         if !bypassFocusPause, shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
+            recordAutoFocusTrace(event: "attempt-paused", reason: "focused-surface")
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
             return
         }
 
         // Ignore stale work items.
-        guard token == autoFocusAttentionToken else { return }
+        guard token == autoFocusAttentionToken else {
+            recordAutoFocusTrace(event: "attempt-abort", reason: "stale-token", details: ["token": "\(token)"])
+            return
+        }
 
         // Enforce minimum attention age (optional).
         let minAgeMs = Double(ghostty.config.autoFocusAttentionMinAge)
@@ -1720,6 +1998,7 @@ class BaseTerminalController: NSWindowController,
                 let msg = "attention autofocusing noCandidates"
                 Ghostty.logger.info("\(msg, privacy: .public)")
             }
+            recordAutoFocusTrace(event: "autofocus-no-candidates", reason: "none-watchable")
             autoFocusAttentionPending = false
             autoFocusAttentionPausedSurfaceId = nil
             autoFocusAttentionPendingSinceUptime = nil
@@ -1733,6 +2012,7 @@ class BaseTerminalController: NSWindowController,
         autoFocusAttentionPending = false
         autoFocusAttentionPausedSurfaceId = nil
         autoFocusAttentionPendingSinceUptime = nil
+        recordAutoFocusTrace(event: "autofocus-focus", reason: "selected-most-recent", target: surface)
         setAttentionOverlay("focus \(surface.id.uuidString.prefix(8))")
         controller.focusSurface(surface)
 
@@ -1885,6 +2165,38 @@ class BaseTerminalController: NSWindowController,
         let viewportProvider = detectAgentProviderFromViewport(surface.cachedVisibleContents.get())
         guard viewportProvider != .unknown else { return false }
         return watched.contains(viewportProvider.rawValue)
+    }
+
+    /// Lightweight watchability check for auto-focus trace logging only.
+    /// This intentionally avoids viewport scans so trace mode stays low-overhead.
+    private func isAttentionSurfaceWatchableForTrace(_ surface: Ghostty.SurfaceView) -> Bool {
+        switch ghostty.config.autoFocusAttentionWatchMode {
+        case .all:
+            return true
+        case .marked:
+            return hasWatchableExplicitAgentMark(surface.title)
+        case .agents:
+            return isDetectedWatchedProviderForTrace(surface)
+        case .agents_or_marked:
+            return hasWatchableExplicitAgentMark(surface.title) || isDetectedWatchedProviderForTrace(surface)
+        }
+    }
+
+    private func isDetectedWatchedProviderForTrace(_ surface: Ghostty.SurfaceView) -> Bool {
+        let watched = watchedProviders()
+        guard !watched.isEmpty else { return false }
+
+        if let stable = agentStable[surface.id],
+           stable.source != .none,
+           let badgeProvider = stable.badgeProvider
+        {
+            let token = canonicalAgentProviderToken(badgeProvider) ?? badgeProvider
+            return watched.contains(token)
+        }
+
+        let titleProvider = detectAgentProviderFromTitle(surface.title)
+        guard titleProvider != .unknown else { return false }
+        return watched.contains(titleProvider.rawValue)
     }
 
     private func hasWatchableExplicitAgentMark(_ title: String) -> Bool {
@@ -2192,24 +2504,39 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func resumeAutoFocusAttention(reason: String, bypassFocusPause: Bool = false) {
+        recordAutoFocusTrace(event: "resume", reason: reason, details: ["bypass_focus_pause": "\(bypassFocusPause)"])
         // If something is pending, resume after a "quiet" period (configurable via
         // auto-focus-attention-resume-delay) without waiting for idle.
         //
         // This resume delay is debounced: any user action during the countdown
         // resets it. Additionally, if the mouse re-enters the focused surface,
         // we pause entirely until the mouse leaves again.
-        guard ghostty.config.autoFocusAttention else { return }
+        guard ghostty.config.autoFocusAttention else {
+            recordAutoFocusTrace(event: "resume-abort", reason: "auto-focus-disabled")
+            return
+        }
         guard autoFocusAttentionPending else {
+            recordAutoFocusTrace(event: "resume-abort", reason: "no-pending", details: ["resume_reason": reason])
             setAttentionOverlay("idle")
             return
         }
-        guard NSApp.isActive else { return }
-        guard window?.isKeyWindow ?? false else { return }
-        guard !commandPaletteIsShowing else { return }
+        guard NSApp.isActive else {
+            recordAutoFocusTrace(event: "resume-abort", reason: "app-inactive", details: ["resume_reason": reason])
+            return
+        }
+        guard window?.isKeyWindow ?? false else {
+            recordAutoFocusTrace(event: "resume-abort", reason: "window-not-key", details: ["resume_reason": reason])
+            return
+        }
+        guard !commandPaletteIsShowing else {
+            recordAutoFocusTrace(event: "resume-abort", reason: "command-palette", details: ["resume_reason": reason])
+            return
+        }
 
         // If the user is actively reading (mouse inside focused surface), do not
         // arm a resume timer. We'll re-enter via mouse exit.
         if !bypassFocusPause, shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
+            recordAutoFocusTrace(event: "resume-paused", reason: "focused-surface", details: ["resume_reason": reason])
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
             return
         }
@@ -2220,6 +2547,7 @@ class BaseTerminalController: NSWindowController,
         let token = autoFocusAttentionToken
 
         let delayMs = ghostty.config.autoFocusAttentionResumeDelay
+        recordAutoFocusTrace(event: "resume-armed", reason: reason, details: ["delay_ms": "\(delayMs)", "bypass_focus_pause": "\(bypassFocusPause)"])
         if delayMs == 0 {
             setAttentionOverlay("resumeNow", reason: reason)
         } else {
@@ -2235,18 +2563,36 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func attemptResumeAutoFocusAttention(token: UInt64, reason: String, delayMs: UInt, bypassFocusPause: Bool) {
-        guard ghostty.config.autoFocusAttention else { return }
+        recordAutoFocusTrace(event: "resume-attempt", reason: reason, details: ["token": "\(token)", "delay_ms": "\(delayMs)", "bypass_focus_pause": "\(bypassFocusPause)"])
+        guard ghostty.config.autoFocusAttention else {
+            recordAutoFocusTrace(event: "resume-attempt-abort", reason: "auto-focus-disabled", details: ["resume_reason": reason])
+            return
+        }
         guard autoFocusAttentionPending else {
+            recordAutoFocusTrace(event: "resume-attempt-abort", reason: "no-pending", details: ["resume_reason": reason])
             setAttentionOverlay("idle")
             return
         }
-        guard NSApp.isActive else { return }
-        guard window?.isKeyWindow ?? false else { return }
-        guard !commandPaletteIsShowing else { return }
-        guard token == autoFocusAttentionToken else { return }
+        guard NSApp.isActive else {
+            recordAutoFocusTrace(event: "resume-attempt-abort", reason: "app-inactive", details: ["resume_reason": reason])
+            return
+        }
+        guard window?.isKeyWindow ?? false else {
+            recordAutoFocusTrace(event: "resume-attempt-abort", reason: "window-not-key", details: ["resume_reason": reason])
+            return
+        }
+        guard !commandPaletteIsShowing else {
+            recordAutoFocusTrace(event: "resume-attempt-abort", reason: "command-palette", details: ["resume_reason": reason])
+            return
+        }
+        guard token == autoFocusAttentionToken else {
+            recordAutoFocusTrace(event: "resume-attempt-abort", reason: "stale-token", details: ["resume_reason": reason, "token": "\(token)"])
+            return
+        }
 
         // If the user is reading/working in a focused surface again, pause entirely.
         if !bypassFocusPause, shouldPauseAutoFocusAttentionBecauseSurfaceFocused() {
+            recordAutoFocusTrace(event: "resume-attempt-paused", reason: "focused-surface", details: ["resume_reason": reason])
             setAttentionOverlay(autoFocusAttentionPending ? "paused(focused): pending" : "paused(focused)")
             return
         }
@@ -2290,9 +2636,12 @@ class BaseTerminalController: NSWindowController,
         // logic handle auto-focus instead of forcing bypass behavior.
         guard shouldPauseAutoFocusAttentionBecauseSurfaceFocused() else { return }
 
+        recordAutoFocusTrace(event: "focused-idle-armed", reason: reason, details: ["threshold_ms": "\(focusedIdleMs)"])
+
         let elapsedMs = (ProcessInfo.processInfo.systemUptime - lastUserActivityUptime) * 1000.0
         let remainingMs = max(0.0, Double(focusedIdleMs) - elapsedMs)
         if remainingMs <= 0 {
+            recordAutoFocusTrace(event: "focused-idle-fire", reason: reason, details: ["threshold_ms": "\(focusedIdleMs)"])
             resumeAutoFocusAttention(reason: reason, bypassFocusPause: true)
             return
         }
@@ -2315,18 +2664,36 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func attemptFocusedIdleResume(token: UInt64, reason: String, thresholdMs: UInt) {
-        guard ghostty.config.autoFocusAttention else { return }
+        recordAutoFocusTrace(event: "focused-idle-attempt", reason: reason, details: ["token": "\(token)", "threshold_ms": "\(thresholdMs)"])
+        guard ghostty.config.autoFocusAttention else {
+            recordAutoFocusTrace(event: "focused-idle-abort", reason: "auto-focus-disabled", details: ["resume_reason": reason])
+            return
+        }
         guard autoFocusAttentionPending else {
+            recordAutoFocusTrace(event: "focused-idle-abort", reason: "no-pending", details: ["resume_reason": reason])
             setAttentionOverlay("idle")
             return
         }
-        guard NSApp.isActive else { return }
-        guard window?.isKeyWindow ?? false else { return }
-        guard !commandPaletteIsShowing else { return }
-        guard token == autoFocusAttentionToken else { return }
+        guard NSApp.isActive else {
+            recordAutoFocusTrace(event: "focused-idle-abort", reason: "app-inactive", details: ["resume_reason": reason])
+            return
+        }
+        guard window?.isKeyWindow ?? false else {
+            recordAutoFocusTrace(event: "focused-idle-abort", reason: "window-not-key", details: ["resume_reason": reason])
+            return
+        }
+        guard !commandPaletteIsShowing else {
+            recordAutoFocusTrace(event: "focused-idle-abort", reason: "command-palette", details: ["resume_reason": reason])
+            return
+        }
+        guard token == autoFocusAttentionToken else {
+            recordAutoFocusTrace(event: "focused-idle-abort", reason: "stale-token", details: ["resume_reason": reason, "token": "\(token)"])
+            return
+        }
 
         // If we are no longer paused-by-focus, regular scheduling should decide.
         guard shouldPauseAutoFocusAttentionBecauseSurfaceFocused() else {
+            recordAutoFocusTrace(event: "focused-idle-handoff", reason: "focus-pause-cleared", details: ["resume_reason": reason])
             scheduleAutoFocusAttention()
             return
         }
@@ -2354,6 +2721,7 @@ class BaseTerminalController: NSWindowController,
             return
         }
 
+        recordAutoFocusTrace(event: "focused-idle-fire", reason: reason, details: ["threshold_ms": "\(thresholdMs)"])
         resumeAutoFocusAttention(reason: reason, bypassFocusPause: true)
     }
 
@@ -2423,6 +2791,18 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func setAttentionOverlay(_ text: String, deadlineUptime: TimeInterval? = nil, reason: String? = nil) {
+        if autoFocusTraceIsEnabled() {
+            var details: [String: String] = [:]
+            if let deadlineUptime {
+                let remainingMs = max(0, Int((deadlineUptime - ProcessInfo.processInfo.systemUptime) * 1000.0))
+                details["remaining_ms"] = "\(remainingMs)"
+            }
+            if let reason {
+                details["overlay_reason"] = reason
+            }
+            recordAutoFocusTrace(event: "overlay", reason: text, details: details)
+        }
+
         guard ghostty.config.attentionDebug else { return }
         attentionOverlayHint = text
         attentionOverlayPlanDeadlineUptime = deadlineUptime
