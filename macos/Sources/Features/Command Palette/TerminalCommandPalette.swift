@@ -159,7 +159,7 @@ struct TerminalCommandPaletteView: View {
         options.append(
             CommandOption(
                 title: "Agent: Export Auto-Focus Trace...",
-                description: "Export always-on auto-focus decision trace (no terminal output)."
+                description: "Export global auto-focus decision trace across tabs/windows (no terminal output)."
             ) {
                 guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return }
                 controller.exportAutoFocusAttentionTrace()

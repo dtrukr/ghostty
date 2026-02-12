@@ -166,6 +166,7 @@ class BaseTerminalController: NSWindowController,
         case none
         case marked
         case title
+        case tmux_status
         case viewport
         case diagnostic
     }
@@ -217,11 +218,12 @@ class BaseTerminalController: NSWindowController,
     private let focusedAgentTraceAutoCaptureSeconds: TimeInterval = 5.0
 
     // Always-on lightweight trace for auto-focus attention decisions (no viewport capture).
-    private var autoFocusTraceSeq: UInt64 = 0
-    private var autoFocusTraceStartedAt: Date? = nil
-    private var autoFocusTraceRing: [String?] = []
-    private var autoFocusTraceRingWriteIndex: Int = 0
-    private var autoFocusTraceRingCount: Int = 0
+    // Global across all terminal controllers so exports don't miss cross-tab/window events.
+    private static var autoFocusTraceSeq: UInt64 = 0
+    private static var autoFocusTraceStartedAt: Date? = nil
+    private static var autoFocusTraceRing: [String?] = []
+    private static var autoFocusTraceRingWriteIndex: Int = 0
+    private static var autoFocusTraceRingCount: Int = 0
     private let autoFocusTraceDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -878,7 +880,7 @@ class BaseTerminalController: NSWindowController,
 
         let panel = NSSavePanel()
         panel.title = "Export Auto-Focus Attention Trace"
-        panel.message = "Exports always-on auto-focus decision timeline (no terminal output)."
+        panel.message = "Exports the global auto-focus timeline across all tabs/windows (no terminal output)."
         panel.nameFieldStringValue = "ghostty-auto-focus-trace-\(debugLogTimestamp()).log"
         panel.canCreateDirectories = true
         panel.allowedFileTypes = ["log", "txt"]
@@ -918,15 +920,15 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func clearAutoFocusTraceBuffer(keepEnabled: Bool = false) {
-        autoFocusTraceSeq = 0
-        autoFocusTraceStartedAt = nil
-        autoFocusTraceRingWriteIndex = 0
-        autoFocusTraceRingCount = 0
-        autoFocusTraceRing.removeAll(keepingCapacity: false)
+        Self.autoFocusTraceSeq = 0
+        Self.autoFocusTraceStartedAt = nil
+        Self.autoFocusTraceRingWriteIndex = 0
+        Self.autoFocusTraceRingCount = 0
+        Self.autoFocusTraceRing.removeAll(keepingCapacity: false)
 
         if keepEnabled, autoFocusTraceIsEnabled() {
-            autoFocusTraceRing = Array(repeating: nil, count: normalizedAutoFocusTraceCapacity())
-            autoFocusTraceStartedAt = Date()
+            Self.autoFocusTraceRing = Array(repeating: nil, count: normalizedAutoFocusTraceCapacity())
+            Self.autoFocusTraceStartedAt = Date()
         }
     }
 
@@ -937,42 +939,42 @@ class BaseTerminalController: NSWindowController,
         }
 
         let capacity = normalizedAutoFocusTraceCapacity()
-        if autoFocusTraceRing.count != capacity {
+        if Self.autoFocusTraceRing.count != capacity {
             let old = autoFocusTraceSnapshotLines().suffix(capacity)
-            autoFocusTraceRing = Array(repeating: nil, count: capacity)
-            autoFocusTraceRingWriteIndex = 0
-            autoFocusTraceRingCount = 0
+            Self.autoFocusTraceRing = Array(repeating: nil, count: capacity)
+            Self.autoFocusTraceRingWriteIndex = 0
+            Self.autoFocusTraceRingCount = 0
             for line in old {
                 appendAutoFocusTraceLine(line)
             }
-        } else if autoFocusTraceRing.isEmpty {
-            autoFocusTraceRing = Array(repeating: nil, count: capacity)
+        } else if Self.autoFocusTraceRing.isEmpty {
+            Self.autoFocusTraceRing = Array(repeating: nil, count: capacity)
         }
 
-        if autoFocusTraceStartedAt == nil {
-            autoFocusTraceStartedAt = Date()
+        if Self.autoFocusTraceStartedAt == nil {
+            Self.autoFocusTraceStartedAt = Date()
             recordAutoFocusTrace(event: "trace-enabled", reason: "config")
         }
     }
 
     private func appendAutoFocusTraceLine(_ line: String) {
-        guard !autoFocusTraceRing.isEmpty else { return }
-        autoFocusTraceRing[autoFocusTraceRingWriteIndex] = line
-        autoFocusTraceRingWriteIndex = (autoFocusTraceRingWriteIndex + 1) % autoFocusTraceRing.count
-        if autoFocusTraceRingCount < autoFocusTraceRing.count {
-            autoFocusTraceRingCount += 1
+        guard !Self.autoFocusTraceRing.isEmpty else { return }
+        Self.autoFocusTraceRing[Self.autoFocusTraceRingWriteIndex] = line
+        Self.autoFocusTraceRingWriteIndex = (Self.autoFocusTraceRingWriteIndex + 1) % Self.autoFocusTraceRing.count
+        if Self.autoFocusTraceRingCount < Self.autoFocusTraceRing.count {
+            Self.autoFocusTraceRingCount += 1
         }
     }
 
     private func autoFocusTraceSnapshotLines() -> [String] {
-        guard autoFocusTraceRingCount > 0, !autoFocusTraceRing.isEmpty else { return [] }
+        guard Self.autoFocusTraceRingCount > 0, !Self.autoFocusTraceRing.isEmpty else { return [] }
 
         var lines: [String] = []
-        lines.reserveCapacity(autoFocusTraceRingCount)
-        let start = (autoFocusTraceRingWriteIndex - autoFocusTraceRingCount + autoFocusTraceRing.count) % autoFocusTraceRing.count
-        for i in 0..<autoFocusTraceRingCount {
-            let idx = (start + i) % autoFocusTraceRing.count
-            if let line = autoFocusTraceRing[idx] {
+        lines.reserveCapacity(Self.autoFocusTraceRingCount)
+        let start = (Self.autoFocusTraceRingWriteIndex - Self.autoFocusTraceRingCount + Self.autoFocusTraceRing.count) % Self.autoFocusTraceRing.count
+        for i in 0..<Self.autoFocusTraceRingCount {
+            let idx = (start + i) % Self.autoFocusTraceRing.count
+            if let line = Self.autoFocusTraceRing[idx] {
                 lines.append(line)
             }
         }
@@ -997,6 +999,76 @@ class BaseTerminalController: NSWindowController,
         traceShortId(surface?.id)
     }
 
+    private func traceObjectId(_ object: AnyObject?) -> String {
+        guard let object else { return "-" }
+        return String(describing: Unmanaged.passUnretained(object).toOpaque())
+    }
+
+    private static func terminalController(for window: NSWindow?) -> BaseTerminalController? {
+        guard let window else { return nil }
+        return window.windowController as? BaseTerminalController
+    }
+
+    private static func allTerminalControllers() -> [BaseTerminalController] {
+        NSApp.windows
+            .compactMap { $0.windowController as? BaseTerminalController }
+    }
+
+    private func traceAttentionSummary(_ surfaces: [Ghostty.SurfaceView], limit: Int = 8) -> String {
+        guard !surfaces.isEmpty else { return "-" }
+
+        let sorted = sortAttentionSurfaces(surfaces)
+        var entries: [String] = []
+        entries.reserveCapacity(min(sorted.count, limit))
+
+        for surface in sorted.prefix(limit) {
+            let owner = Self.terminalController(for: surface.window)
+            let watchable = owner?.isAttentionSurfaceWatchableForTrace(surface) ?? false
+            let win = surface.window?.windowNumber ?? -1
+            let tab = owner?.tabGroupPositionLabel(for: surface.window) ?? "?"
+            entries.append("\(traceShortSurface(surface))@w\(win)t\(tab)\(watchable ? "w" : "-")")
+        }
+        if sorted.count > limit {
+            entries.append("+\(sorted.count - limit)")
+        }
+        return entries.joined(separator: ",")
+    }
+
+    private func tracePendingSummary(_ controllers: [BaseTerminalController], limit: Int = 8) -> String {
+        let pending = controllers.filter { $0.autoFocusAttentionPending }
+        guard !pending.isEmpty else { return "-" }
+
+        var entries: [String] = []
+        entries.reserveCapacity(min(pending.count, limit))
+        for controller in pending.prefix(limit) {
+            let win = controller.window?.windowNumber ?? -1
+            let focused = controller.windowFirstResponderSurfaceView() ?? controller.focusedSurface
+            entries.append("w\(win):\(traceShortSurface(focused))")
+        }
+        if pending.count > limit {
+            entries.append("+\(pending.count - limit)")
+        }
+        return entries.joined(separator: ",")
+    }
+
+    private func appendMouseTrace(parts: inout [String], activeSurface: Ghostty.SurfaceView?) {
+        let mouseScreen = NSEvent.mouseLocation
+        parts.append("mouse_screen_x=\(Int(mouseScreen.x.rounded()))")
+        parts.append("mouse_screen_y=\(Int(mouseScreen.y.rounded()))")
+
+        guard let window else { return }
+        let mouseWindow = window.convertPoint(fromScreen: mouseScreen)
+        parts.append("mouse_window_x=\(Int(mouseWindow.x.rounded()))")
+        parts.append("mouse_window_y=\(Int(mouseWindow.y.rounded()))")
+
+        guard let activeSurface else { return }
+        let mouseSurface = activeSurface.convert(mouseWindow, from: nil)
+        let inside = activeSurface.bounds.contains(mouseSurface)
+        parts.append("mouse_focused_x=\(Int(mouseSurface.x.rounded()))")
+        parts.append("mouse_focused_y=\(Int(mouseSurface.y.rounded()))")
+        parts.append("mouse_focused_inside=\(inside ? 1 : 0)")
+    }
+
     private func recordAutoFocusTrace(
         event: String,
         reason: String? = nil,
@@ -1006,16 +1078,33 @@ class BaseTerminalController: NSWindowController,
         guard autoFocusTraceIsEnabled() else { return }
         syncAutoFocusTraceConfig()
 
-        autoFocusTraceSeq &+= 1
+        Self.autoFocusTraceSeq &+= 1
 
         let nowUptime = ProcessInfo.processInfo.systemUptime
         let pendingAgeMs: Int = {
             guard let since = autoFocusAttentionPendingSinceUptime else { return -1 }
             return Int(max(0, (nowUptime - since) * 1000.0))
         }()
+        let activeSurface = windowFirstResponderSurfaceView() ?? focusedSurface
+        let responderSurface = windowFirstResponderSurfaceView()
+        let keyWindow = NSApp.keyWindow
+        let keyController = Self.terminalController(for: keyWindow)
+        let keyFocusedSurface = keyController?.windowFirstResponderSurfaceView() ?? keyController?.focusedSurface
+        let groupObject: AnyObject? = {
+            guard let window else { return nil }
+            return window.tabGroup ?? window
+        }()
+
+        let groupWindows: [NSWindow] = if let window {
+            window.tabGroup?.windows ?? [window]
+        } else {
+            []
+        }
+        let groupControllers = groupWindows.compactMap { Self.terminalController(for: $0) }
+        let allControllers = Self.allTerminalControllers()
 
         var parts: [String] = []
-        parts.append("seq=\(autoFocusTraceSeq)")
+        parts.append("seq=\(Self.autoFocusTraceSeq)")
         parts.append("ts=\(traceQuoted(autoFocusTraceDateFormatter.string(from: Date())))")
         parts.append("uptime=\(String(format: "%.3f", nowUptime))")
         parts.append("event=\(traceQuoted(event))")
@@ -1023,25 +1112,53 @@ class BaseTerminalController: NSWindowController,
             parts.append("reason=\(traceQuoted(reason))")
         }
 
+        parts.append("controller=\(traceObjectId(self))")
         parts.append("window=\(window?.windowNumber ?? -1)")
+        parts.append("tab=\(traceQuoted(tabGroupPositionLabel(for: window)))")
+        parts.append("group=\(traceObjectId(groupObject))")
+        parts.append("key_window=\(keyWindow?.windowNumber ?? -1)")
+        parts.append("main_window=\(NSApp.mainWindow?.windowNumber ?? -1)")
+        parts.append("app_active=\(NSApp.isActive ? 1 : 0)")
         parts.append("watch_mode=\(traceQuoted(ghostty.config.autoFocusAttentionWatchMode.rawValue))")
         parts.append("pending=\(autoFocusAttentionPending ? 1 : 0)")
         parts.append("pending_age_ms=\(pendingAgeMs)")
         parts.append("token=\(autoFocusAttentionToken)")
-        parts.append("focused=\(traceShortSurface(windowFirstResponderSurfaceView() ?? focusedSurface))")
+        parts.append("focused=\(traceShortSurface(activeSurface))")
+        parts.append("responder=\(traceShortSurface(responderSurface))")
+        parts.append("key_focused=\(traceShortSurface(keyFocusedSurface))")
         parts.append("lock=\(traceShortId(autoFocusAttentionFocusLockSurfaceId))")
         parts.append("paused=\(traceShortId(autoFocusAttentionPausedSurfaceId))")
+        parts.append("mouse_inside_gate=\(autoFocusAttentionMouseInsideFocusedSurface ? 1 : 0)")
+        parts.append("pending_group=\(groupControllers.filter { $0.autoFocusAttentionPending }.count)")
+        parts.append("pending_app=\(allControllers.filter { $0.autoFocusAttentionPending }.count)")
+        parts.append("pending_windows=\(traceQuoted(tracePendingSummary(allControllers)))")
 
-        let bellSurfaces = attentionSurfacesAcrossTabGroup(applyWatchFilter: false)
-        let watchableCount = bellSurfaces.filter { isAttentionSurfaceWatchableForTrace($0) }.count
-        let allCount = bellSurfaces.count
-        parts.append("marks_watchable=\(watchableCount)")
-        parts.append("marks_all=\(allCount)")
+        appendMouseTrace(parts: &parts, activeSurface: activeSurface)
+
+        let groupBellSurfaces = attentionSurfacesAcrossTabGroup(applyWatchFilter: false)
+        let groupWatchableCount = groupBellSurfaces.filter { isAttentionSurfaceWatchableForTrace($0) }.count
+        let groupAllCount = groupBellSurfaces.count
+        parts.append("marks_group_watchable=\(groupWatchableCount)")
+        parts.append("marks_group_all=\(groupAllCount)")
+        parts.append("marks_group=\(traceQuoted(traceAttentionSummary(groupBellSurfaces)))")
+
+        let appBellSurfaces = allControllers.flatMap { controller in
+            controller.attentionSurfaces(in: controller, applyWatchFilter: false)
+        }
+        let appWatchableCount = appBellSurfaces.filter { surface in
+            guard let owner = Self.terminalController(for: surface.window) else { return false }
+            return owner.isAttentionSurfaceWatchableForTrace(surface)
+        }.count
+        parts.append("marks_app_watchable=\(appWatchableCount)")
+        parts.append("marks_app_all=\(appBellSurfaces.count)")
+        parts.append("marks_app=\(traceQuoted(traceAttentionSummary(appBellSurfaces)))")
 
         if let target {
+            let owner = Self.terminalController(for: target.window)
             parts.append("target=\(traceShortSurface(target))")
             parts.append("target_window=\(target.window?.windowNumber ?? -1)")
-            parts.append("target_watchable=\(isAttentionSurfaceWatchableForTrace(target) ? 1 : 0)")
+            parts.append("target_tab=\(traceQuoted(owner?.tabGroupPositionLabel(for: target.window) ?? "?"))")
+            parts.append("target_watchable=\(owner?.isAttentionSurfaceWatchableForTrace(target) == true ? 1 : 0)")
             parts.append("target_bell=\(target.bell ? 1 : 0)")
             parts.append("target_badge=\(traceQuoted(agentBadgeSummary(for: target)))")
         }
@@ -1058,15 +1175,22 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func buildAutoFocusTraceLog() -> String {
+        let controllers = Self.allTerminalControllers().sorted { a, b in
+            (a.window?.windowNumber ?? -1) < (b.window?.windowNumber ?? -1)
+        }
+
         var lines: [String] = []
         lines.append("# Ghostty Auto-Focus Attention Trace")
+        lines.append("trace_scope=global")
         lines.append("generated_at=\(autoFocusTraceDateFormatter.string(from: Date()))")
-        if let started = autoFocusTraceStartedAt {
+        if let started = Self.autoFocusTraceStartedAt {
             lines.append("started_at=\(autoFocusTraceDateFormatter.string(from: started))")
         }
         lines.append("trace_enabled=\(autoFocusTraceIsEnabled())")
-        lines.append("trace_capacity=\(autoFocusTraceRing.count)")
-        lines.append("trace_events=\(autoFocusTraceRingCount)")
+        lines.append("trace_capacity=\(Self.autoFocusTraceRing.count)")
+        lines.append("trace_events=\(Self.autoFocusTraceRingCount)")
+        lines.append("controllers=\(controllers.count)")
+        lines.append("windows=\(NSApp.windows.count)")
         lines.append("auto_focus_attention=\(ghostty.config.autoFocusAttention)")
         lines.append("auto_focus_attention_idle_ms=\(ghostty.config.autoFocusAttentionIdle)")
         lines.append("auto_focus_attention_resume_delay_ms=\(ghostty.config.autoFocusAttentionResumeDelay)")
@@ -1076,6 +1200,18 @@ class BaseTerminalController: NSWindowController,
         lines.append("auto_focus_attention_watch_mode=\(ghostty.config.autoFocusAttentionWatchMode.rawValue)")
         lines.append("attention_watch_providers=\(ghostty.config.attentionWatchProviders)")
         lines.append("attention_provider_lock=\(ghostty.config.attentionProviderLock)")
+        lines.append("")
+        lines.append("[controllers]")
+        for controller in controllers {
+            let window = controller.window
+            let focused = controller.windowFirstResponderSurfaceView() ?? controller.focusedSurface
+            let responder = controller.windowFirstResponderSurfaceView()
+            let watchable = controller.attentionSurfacesAcrossTabGroup(applyWatchFilter: true).count
+            let all = controller.attentionSurfacesAcrossTabGroup(applyWatchFilter: false).count
+            lines.append(
+                "controller=\(traceObjectId(controller)) window=\(window?.windowNumber ?? -1) tab=\(tabGroupPositionLabel(for: window)) key=\((window?.isKeyWindow ?? false) ? 1 : 0) pending=\(controller.autoFocusAttentionPending ? 1 : 0) focused=\(traceShortSurface(focused)) responder=\(traceShortSurface(responder)) lock=\(traceShortId(controller.autoFocusAttentionFocusLockSurfaceId)) paused=\(traceShortId(controller.autoFocusAttentionPausedSurfaceId)) mouse_inside=\(controller.autoFocusAttentionMouseInsideFocusedSurface ? 1 : 0) marks=\(watchable)/\(all)"
+            )
+        }
         lines.append("")
 
         lines.append(contentsOf: autoFocusTraceSnapshotLines())
@@ -1722,6 +1858,12 @@ class BaseTerminalController: NSWindowController,
             let msg = "attention goto received controllerWindow=\(self.window?.windowNumber ?? -1) source=\(source.id.uuidString) direction=\(String(describing: direction))"
             Ghostty.logger.info("\(msg, privacy: .public)")
         }
+        recordAutoFocusTrace(
+            event: "goto-attention",
+            reason: "manual",
+            target: source,
+            details: ["direction": "\(direction)"]
+        )
         cycleAttention(direction: direction, preferCurrentTab: true)
     }
 
@@ -2075,6 +2217,16 @@ class BaseTerminalController: NSWindowController,
             let msg = "attention cycle pick direction=\(String(describing: direction)) preferCurrentTab=\(preferCurrentTab) candidates=\(candidates.count) last=\(lastStr) next=\(next.id.uuidString) targetWindow=\(next.window?.windowNumber ?? -1)"
             Ghostty.logger.info("\(msg, privacy: .public)")
         }
+        recordAutoFocusTrace(
+            event: "goto-attention-focus",
+            reason: "manual-cycle",
+            target: next,
+            details: [
+                "direction": "\(direction)",
+                "prefer_current_tab": "\(preferCurrentTab)",
+                "candidates": "\(candidates.count)",
+            ]
+        )
         guard let targetWindow = next.window,
               let targetController = targetWindow.windowController as? BaseTerminalController
         else { return }
@@ -2340,6 +2492,10 @@ class BaseTerminalController: NSWindowController,
         // Only track activity for events targeting our window.
         guard let window, event.window == window else { return }
         lastUserActivityUptime = ProcessInfo.processInfo.systemUptime
+        if autoFocusAttentionPending {
+            let kind = String(describing: event.type)
+            recordAutoFocusTrace(event: "user-activity", reason: kind)
+        }
     }
 
     private func localEventFlagsChanged(_ event: NSEvent) -> NSEvent? {
@@ -2383,6 +2539,15 @@ class BaseTerminalController: NSWindowController,
             // Assume the mouse is inside the newly focused surface (common case:
             // focus via click). We'll update this via enter/exit events.
             autoFocusAttentionMouseInsideFocusedSurface = true
+            recordAutoFocusTrace(
+                event: "focus-change",
+                reason: "surface-change",
+                target: to,
+                details: [
+                    "from": traceShortSurface(lastFocusedSurface),
+                    "to": traceShortSurface(to),
+                ]
+            )
 
             // If we were locked on a surface (due to auto-focus) and focus moved
             // away from it, clear the lock so attention can resume as configured.
@@ -2489,6 +2654,11 @@ class BaseTerminalController: NSWindowController,
         let active = (surface === focusedSurface) || (surface === windowFirstResponderSurfaceView())
         guard active else { return }
         autoFocusAttentionMouseInsideFocusedSurface = inside
+        recordAutoFocusTrace(
+            event: "focused-surface-mouse",
+            reason: inside ? "inside" : "outside",
+            target: surface
+        )
 
         if inside {
             // If a resume timer is armed, cancel it. The user re-entered the pane,
@@ -2965,13 +3135,21 @@ class BaseTerminalController: NSWindowController,
                 let text = surface.cachedVisibleContents.get()
                 sampledViewportText = text
                 let preferredProvider = currentLock?.provider ?? remembered?.provider
-                let viewportProvider: AgentProvider = allowAutodetectionForSurface ? detectAgentProviderFromViewport(text, preferred: preferredProvider) : .unknown
+                let tmuxStatusProvider: AgentProvider? = allowAutodetectionForSurface ? detectAgentProviderFromTmuxStatusLine(text) : nil
+                let viewportProvider: AgentProvider = {
+                    if let tmuxStatusProvider { return tmuxStatusProvider }
+                    if allowAutodetectionForSurface {
+                        return detectAgentProviderFromViewportCore(text, preferred: preferredProvider)
+                    }
+                    return .unknown
+                }()
+                let viewportSource: AgentDetectionSource = tmuxStatusProvider == nil ? .viewport : .tmux_status
 
                 if allowAutodetectionForSurface {
                     if source == .none {
                         if viewportProvider != .unknown {
                             provider = viewportProvider
-                            source = .viewport
+                            source = viewportSource
                             badgeProvider = viewportProvider.rawValue
                         }
                     } else if source == .title {
@@ -2996,7 +3174,7 @@ class BaseTerminalController: NSWindowController,
                                 // Prefer live viewport evidence if it disagrees with title,
                                 // except codex<->opencode where cross-mentions are common.
                                 provider = viewportProvider
-                                source = .viewport
+                                source = viewportSource
                                 badgeProvider = viewportProvider.rawValue
                             }
                         }
@@ -3111,7 +3289,7 @@ class BaseTerminalController: NSWindowController,
                     return .marked
                 case .diagnostic:
                     return .diagnostic
-                case .title, .viewport:
+                case .title, .tmux_status, .viewport:
                     return diagnosticsBadgeEnabled() ? .diagnostic : .detected
                 case .none:
                     return .none
@@ -3155,7 +3333,7 @@ class BaseTerminalController: NSWindowController,
 
     private func providerLockAllowsSource(_ source: AgentDetectionSource) -> Bool {
         switch source {
-        case .title, .viewport, .diagnostic:
+        case .title, .tmux_status, .viewport, .diagnostic:
             return true
         case .none, .marked:
             return false
@@ -3445,7 +3623,52 @@ class BaseTerminalController: NSWindowController,
         return best
     }
 
+    private func tmuxStatusWindowToken(_ token: String) -> Bool {
+        guard let colon = token.firstIndex(of: ":") else { return false }
+        let indexPart = token[..<colon]
+        guard !indexPart.isEmpty else { return false }
+        return indexPart.allSatisfy(\.isNumber)
+    }
+
+    private func detectAgentProviderFromTmuxStatusLine(_ viewportText: String) -> AgentProvider? {
+        let tailLines = nonEmptyLines(viewportText).suffix(4)
+        guard !tailLines.isEmpty else { return nil }
+
+        for rawLine in tailLines.reversed() {
+            let line = stripAnsiLikeAoe(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+
+            let tokens = line
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+            guard tokens.count >= 2 else { continue }
+
+            var idx = 0
+            while idx < tokens.count, tmuxStatusWindowToken(tokens[idx]) {
+                idx += 1
+            }
+            // We only treat this as tmux status if it starts with tmux window tokens.
+            guard idx > 0, idx < tokens.count else { continue }
+
+            let rightFirstToken = tokens[idx]
+            guard let canonical = canonicalAgentProviderToken(rightFirstToken),
+                  let provider = AgentProvider(rawValue: canonical)
+            else { continue }
+
+            return provider
+        }
+
+        return nil
+    }
+
     private func detectAgentProviderFromViewport(_ viewportText: String, preferred: AgentProvider? = nil) -> AgentProvider {
+        if let tmuxProvider = detectAgentProviderFromTmuxStatusLine(viewportText) {
+            return tmuxProvider
+        }
+        return detectAgentProviderFromViewportCore(viewportText, preferred: preferred)
+    }
+
+    private func detectAgentProviderFromViewportCore(_ viewportText: String, preferred: AgentProvider? = nil) -> AgentProvider {
         let tailLower = detectionTailLower(viewportText, lineCount: 36)
         let fullLower = viewportText.lowercased()
         func hasAny(_ s: String, _ needles: [String]) -> Bool { needles.contains(where: s.contains) }

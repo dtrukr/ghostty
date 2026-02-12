@@ -105,7 +105,8 @@ Optional debug logs:
 attention-debug = true
 ```
 
-Optional always-on auto-focus trace (lightweight, no viewport/terminal output):
+Optional always-on auto-focus trace (lightweight, no viewport/terminal output).
+This trace is global across terminal tabs/windows and includes focus/mouse context:
 
 ```conf
 attention-auto-focus-trace = true
@@ -388,7 +389,7 @@ Per-surface badge (UI):
 - Ghostty shows a small top-left badge on each surface when agent filtering is
   active (`auto-focus-attention-watch-mode != all`) or when `attention-debug = true`.
 - `tag` badge = explicitly marked surface (`[agent:NAME]`).
-- `sparkles` badge = auto-detected provider (title/viewport heuristics).
+- `sparkles` badge = auto-detected provider (tmux status line, then title/viewport heuristics).
 - `stethoscope` badge = diagnostics-only autodetection signal (does not affect watch eligibility).
 
 Additionally, auto-focus can enforce a minimum attention age:
