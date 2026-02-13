@@ -3748,6 +3748,8 @@ class BaseTerminalController: NSWindowController,
     }
 
     private static let aoeSpinnerChars: [String] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    private static let aoeAsteriskSpinnerChars: [String] = ["✳", "✽", "✶", "✢"]
+    private static let openCodePulseSpinnerChars: [String] = ["█", "▓", "▒", "░"]
 
     private func detectionTailLower(_ content: String, lineCount: Int) -> String {
         let nonEmpty = nonEmptyLines(content)
@@ -3769,8 +3771,91 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func containsSpinner(_ content: String) -> Bool {
-        for sp in Self.aoeSpinnerChars where content.contains(sp) { return true }
+        // Restrict to recent viewport lines to avoid stale scrollback artifacts.
+        let recent = nonEmptyLines(content).suffix(30)
+        for line in recent {
+            for sp in Self.aoeSpinnerChars where line.contains(sp) { return true }
+        }
         return false
+    }
+
+    private func containsAsteriskSpinnerWithActiveContext(_ content: String) -> Bool {
+        let recent = nonEmptyLines(content).suffix(20)
+        for line in recent {
+            let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { continue }
+            guard Self.aoeAsteriskSpinnerChars.contains(where: clean.contains) else { continue }
+
+            let lower = clean.lowercased()
+            if lower.contains("…") ||
+                lower.contains("tokens") ||
+                lower.contains("interrupt") ||
+                lower.contains("thinking")
+            {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func hasBusyInterruptContext(_ content: String, phrase: String) -> Bool {
+        let normalizedPhrase = phrase.lowercased()
+        let recent = nonEmptyLines(content).suffix(25)
+        for line in recent {
+            let clean = stripAnsiLikeAoe(line)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard clean.contains(normalizedPhrase) else { continue }
+
+            if clean == normalizedPhrase {
+                return true
+            }
+
+            if clean.contains("(") ||
+                clean.contains("tokens") ||
+                clean.contains("thinking") ||
+                clean.contains("…") ||
+                clean.contains("·")
+            {
+                return true
+            }
+
+            if Self.aoeSpinnerChars.contains(where: clean.contains) ||
+                Self.aoeAsteriskSpinnerChars.contains(where: clean.contains)
+            {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func containsOpenCodeBusyIndicator(_ content: String) -> Bool {
+        let lower = content.lowercased()
+
+        if hasBusyInterruptContext(content, phrase: "esc interrupt") ||
+            hasBusyInterruptContext(content, phrase: "esc to interrupt") ||
+            lower.contains("esc to exit")
+        {
+            return true
+        }
+
+        if Self.openCodePulseSpinnerChars.contains(where: content.contains) {
+            return true
+        }
+
+        let busyStrings = [
+            "thinking...",
+            "thinking…",
+            "generating...",
+            "generating…",
+            "building tool call...",
+            "building tool call…",
+            "waiting for tool response...",
+            "waiting for tool response…",
+        ]
+        return busyStrings.contains(where: lower.contains)
     }
 
     private func stripAnsiLikeAoe(_ s: String) -> String {
@@ -3798,10 +3883,10 @@ class BaseTerminalController: NSWindowController,
         let clean = stripAnsiLikeAoe(line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return false }
 
-        if clean.hasPrefix("➜ ") || clean.hasPrefix("$ ") || clean.hasPrefix("% ") || clean.hasPrefix("# ") {
+        if clean.hasPrefix("➜ ") || clean.hasPrefix("❯ ") || clean.hasPrefix("› ") || clean.hasPrefix("$ ") || clean.hasPrefix("% ") || clean.hasPrefix("# ") {
             return true
         }
-        if clean.hasSuffix("$") || clean.hasSuffix("%") || clean.hasSuffix("#") {
+        if clean.hasSuffix("❯") || clean.hasSuffix("›") || clean.hasSuffix("$") || clean.hasSuffix("%") || clean.hasSuffix("#") {
             return true
         }
 
@@ -3813,19 +3898,21 @@ class BaseTerminalController: NSWindowController,
         let nonEmpty = nonEmptyLines(content)
         let last = lastLines(nonEmpty, count: 30)
         let lastLower = last.lowercased()
+        let interruptBusy = hasBusyInterruptContext(last, phrase: "esc to interrupt") ||
+            hasBusyInterruptContext(last, phrase: "ctrl+c to interrupt")
+        let spinnerBusy = containsSpinner(content) || containsAsteriskSpinnerWithActiveContext(content)
 
         if let lastLine = nonEmpty.last,
            looksLikeShellPromptLine(lastLine),
-           !lastLower.contains("esc to interrupt"),
-           !lastLower.contains("ctrl+c to interrupt"),
-           !containsSpinner(content)
+           !interruptBusy,
+           !spinnerBusy
         {
             return .idle
         }
-        if lastLower.contains("esc to interrupt") || lastLower.contains("ctrl+c to interrupt") {
+        if interruptBusy {
             return .running
         }
-        if containsSpinner(content) {
+        if spinnerBusy {
             return .running
         }
         if lastLower.contains("enter to select") || lastLower.contains("esc to cancel") {
@@ -3875,10 +3962,7 @@ class BaseTerminalController: NSWindowController,
         let last = lastLines(nonEmpty, count: 30)
         let lastLower = last.lowercased()
 
-        if lastLower.contains("esc to interrupt") || lastLower.contains("esc interrupt") {
-            return .running
-        }
-        if containsSpinner(content) {
+        if containsOpenCodeBusyIndicator(content) || containsSpinner(content) {
             return .running
         }
         if lastLower.contains("enter to select") || lastLower.contains("esc to cancel") {
@@ -4018,15 +4102,16 @@ class BaseTerminalController: NSWindowController,
         let nonEmpty = nonEmptyLines(content)
         let last = lastLines(nonEmpty, count: 30)
         let lastLower = last.lowercased()
+        let interruptBusy = hasBusyInterruptContext(last, phrase: "esc to interrupt") ||
+            hasBusyInterruptContext(last, phrase: "ctrl+c to interrupt")
 
-        if lastLower.contains("esc to interrupt")
-            || lastLower.contains("ctrl+c to interrupt")
-            || lastLower.contains("working")
+        if interruptBusy ||
+            lastLower.contains("working")
             || lastLower.contains("thinking")
         {
             return .running
         }
-        if containsSpinner(content) { return .running }
+        if containsSpinner(content) || containsAsteriskSpinnerWithActiveContext(content) { return .running }
 
         let approval = ["approve", "allow", "(y/n)", "[y/n]", "continue?", "proceed?", "execute?", "run command?"]
         for p in approval where lastLower.contains(p) { return .waiting }
